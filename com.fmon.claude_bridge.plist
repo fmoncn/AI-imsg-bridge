@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fmon.claude_bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/fmon/Documents/2026/claude-imessage-bridge-v2/main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/fmon/Documents/2026/claude-imessage-bridge-v2</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/fmon/.claude_bridge/logs/launch_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/fmon/.claude_bridge/logs/launch_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/fmon/.npm-global/bin</string>
+        <key>HOME</key>
+        <string>/Users/fmon</string>
+    </dict>
+</dict>
+</plist>
