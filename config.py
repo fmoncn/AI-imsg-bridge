@@ -29,6 +29,11 @@ CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "2000"))
 MEMORY_TURNS   = int(os.getenv("MEMORY_TURNS", "10"))   # 每个模型保留最近 N 轮对话
 MEMORY_DIR     = os.path.expanduser("~/.claude_bridge/memory")
 
+# ── 平台选择 ───────────────────────────────────
+PLATFORM               = os.getenv("PLATFORM", "imessage")  # imessage / dingtalk
+DINGTALK_CLIENT_ID     = os.getenv("DINGTALK_CLIENT_ID", "")
+DINGTALK_CLIENT_SECRET = os.getenv("DINGTALK_CLIENT_SECRET", "")
+
 # ── 联网搜索 ───────────────────────────────────
 TAVILY_API_KEY       = os.getenv("TAVILY_API_KEY", "")
 TAVILY_SEARCH_URL    = "https://api.tavily.com/search"
