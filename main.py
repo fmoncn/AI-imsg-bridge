@@ -542,9 +542,9 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
 
         elif model_type == "gemini":
             if memory.has_session("gemini"):
-                cmd = [path, "-p", full_content, "--resume", "latest"]
+                cmd = [path, "-y", "-p", full_content, "--resume", "latest"]
             else:
-                cmd = [path, "-p", full_content]
+                cmd = [path, "-y", "-p", full_content]
 
         elif model_type == "codex":
             ctx         = memory.get_context("codex")
