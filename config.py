@@ -29,6 +29,11 @@ CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "2000"))
 MEMORY_TURNS   = int(os.getenv("MEMORY_TURNS", "10"))   # 每个模型保留最近 N 轮对话
 MEMORY_DIR     = os.path.expanduser("~/.claude_bridge/memory")
 
+# ── 联网搜索 ───────────────────────────────────
+TAVILY_API_KEY       = os.getenv("TAVILY_API_KEY", "")
+TAVILY_SEARCH_URL    = "https://api.tavily.com/search"
+PROGRESS_INTERVAL    = int(os.getenv("PROGRESS_INTERVAL", "20"))  # 进度通知间隔（秒）
+
 # ── PATH 补全（launchd 环境变量不完整时） ───────
 ROBUST_PATH = (
     "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"

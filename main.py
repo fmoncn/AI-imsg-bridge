@@ -7,6 +7,8 @@ import json
 import logging
 import tempfile
 import shutil
+import subprocess
+import aiohttp
 from logging.handlers import RotatingFileHandler
 
 from config import (
@@ -14,6 +16,7 @@ from config import (
     DB_PATH, LOG_DIR, CLI_PATHS,
     DEFAULT_MODEL, TASK_TIMEOUT, CHUNK_SIZE, ROBUST_PATH,
     MEMORY_TURNS, MEMORY_DIR,
+    TAVILY_API_KEY, TAVILY_SEARCH_URL, PROGRESS_INTERVAL,
 )
 
 # ── 日志 ──────────────────────────────────────────────────────────────────────
@@ -31,13 +34,9 @@ logger.addHandler(_ch)
 
 # ── 对话记忆 ──────────────────────────────────────────────────────────────────
 class ConversationMemory:
-    """每个模型独立维护对话历史，持久化到本地 JSON"""
-
     def __init__(self):
-        # { model: [{"role": "user"|"assistant", "content": str, "ts": float}, ...] }
         self._history: dict[str, list[dict]] = {}
-        # 记录各模型是否已有活跃会话（影响 --continue/--resume 标志）
-        self._has_session: dict[str, bool] = {}
+        self._has_session: dict[str, bool]   = {}
         self._load_all()
 
     def _path(self, model: str) -> str:
@@ -64,10 +63,8 @@ class ConversationMemory:
     def _save(self, model: str):
         try:
             with open(self._path(model), "w") as f:
-                json.dump({
-                    "history":     self._history[model],
-                    "has_session": self._has_session[model],
-                }, f, ensure_ascii=False, indent=2)
+                json.dump({"history": self._history[model], "has_session": self._has_session[model]},
+                          f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"保存 {model} 历史失败: {e}")
 
@@ -75,7 +72,6 @@ class ConversationMemory:
         if model not in self._history:
             self._history[model] = []
         self._history[model].append({"role": role, "content": content, "ts": time.time()})
-        # 只保留最近 MEMORY_TURNS 轮（每轮 = user + assistant，所以 *2）
         if len(self._history[model]) > MEMORY_TURNS * 2:
             self._history[model] = self._history[model][-(MEMORY_TURNS * 2):]
         if role == "assistant":
@@ -83,7 +79,6 @@ class ConversationMemory:
         self._save(model)
 
     def get_context(self, model: str) -> str:
-        """为 Codex 构建对话上下文字符串"""
         history = self._history.get(model, [])
         if not history:
             return ""
@@ -112,10 +107,8 @@ class ConversationMemory:
         turns   = len([m for m in history if m["role"] == "user"])
         if not history:
             return "无历史记录"
-        last_ts = history[-1]["ts"]
-        age_min = int((time.time() - last_ts) / 60)
+        age_min = int((time.time() - history[-1]["ts"]) / 60)
         return f"{turns} 轮对话，最后活跃 {age_min} 分钟前"
-
 
 memory = ConversationMemory()
 
@@ -175,8 +168,76 @@ def verify_secret(content: str) -> tuple[bool, str]:
         return True, content[len(BRIDGE_SECRET) + 1:].strip()
     return False, content
 
-# ── 数据库 ────────────────────────────────────────────────────────────────────
-def get_last_message() -> tuple[str | None, int | None]:
+# ── Tavily 联网搜索 ───────────────────────────────────────────────────────────
+_SEARCH_KEYWORDS = re.compile(
+    r'最新|今天|现在|新闻|价格|股价|天气|多少|哪里|什么时候|最近|昨天|明天'
+    r'|今年|本周|上周|实时|现价|汇率|涨跌|发布|上市|热点|趋势|排行'
+    r'|latest|today|now|news|price|weather|current|recent|trending',
+    re.IGNORECASE,
+)
+
+def should_search(content: str) -> bool:
+    return bool(_SEARCH_KEYWORDS.search(content)) and bool(TAVILY_API_KEY)
+
+async def tavily_search(query: str) -> str | None:
+    """调用 Tavily API，返回格式化的搜索摘要"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "api_key":     TAVILY_API_KEY,
+                "query":       query,
+                "max_results": 5,
+                "search_depth": "basic",
+            }
+            async with session.post(TAVILY_SEARCH_URL, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Tavily 返回 {resp.status}")
+                    return None
+                data = await resp.json()
+
+        results = data.get("results", [])
+        if not results:
+            return None
+
+        lines = ["[联网搜索结果]"]
+        for i, r in enumerate(results[:5], 1):
+            lines.append(f"{i}. {r.get('title', '')}")
+            lines.append(f"   {r.get('content', '')[:200]}")
+        lines.append("[以上为实时搜索结果，请结合回答]\n")
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.warning(f"Tavily 搜索失败: {e}")
+        return None
+
+# ── 图片处理 ──────────────────────────────────────────────────────────────────
+def prepare_image(raw_path: str) -> str | None:
+    """展开路径，HEIC 转 JPEG，返回可用路径"""
+    path = os.path.expanduser(raw_path)
+    if not os.path.exists(path):
+        logger.warning(f"附件不存在: {path}")
+        return None
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".heic", ".heif"):
+        try:
+            jpg_path = tempfile.mktemp(suffix=".jpg", prefix="bridge_img_")
+            subprocess.run(
+                ["sips", "-s", "format", "jpeg", path, "--out", jpg_path],
+                check=True, capture_output=True,
+            )
+            logger.info(f"🖼️ HEIC→JPEG: {jpg_path}")
+            return jpg_path
+        except Exception as e:
+            logger.warning(f"图片转换失败: {e}")
+            return None
+
+    return path  # PNG / GIF / JPEG 直接返回
+
+
+# ── 数据库（含附件查询）─────────────────────────────────────────────────────
+def get_last_message() -> tuple[str | None, int | None, str | None]:
+    """返回 (文本内容, 日期戳, 附件路径 or None)"""
     for attempt in range(3):
         tmp_db = tmp_wal = tmp_shm = None
         try:
@@ -194,20 +255,40 @@ def get_last_message() -> tuple[str | None, int | None]:
             conn.row_factory = sqlite3.Row
             cur  = conn.cursor()
             placeholders = ', '.join(['?'] * len(SENDER_IDS))
+
+            # 主消息
             cur.execute(f"""
-                SELECT message.text, message.attributedBody, message.date, handle.id AS sender
+                SELECT message.rowid, message.text, message.attributedBody,
+                       message.date, handle.id AS sender
                 FROM message
                 JOIN handle ON message.handle_id = handle.rowid
                 WHERE handle.id IN ({placeholders}) AND message.is_from_me = 0
                 ORDER BY message.date DESC LIMIT 1
             """, SENDER_IDS)
             row = cur.fetchone()
-            conn.close()
 
-            if row:
-                text = row['text'] or decode_attributed_body(row['attributedBody'])
-                return text, row['date']
-            return None, None
+            if not row:
+                conn.close()
+                return None, None, None
+
+            text        = row['text'] or decode_attributed_body(row['attributedBody'])
+            msg_date    = row['date']
+            msg_rowid   = row['rowid']
+
+            # 查附件
+            cur.execute("""
+                SELECT attachment.filename, attachment.mime_type
+                FROM attachment
+                JOIN message_attachment_join ON attachment.rowid = message_attachment_join.attachment_id
+                WHERE message_attachment_join.message_id = ?
+                  AND attachment.mime_type LIKE 'image/%'
+                LIMIT 1
+            """, (msg_rowid,))
+            att_row    = cur.fetchone()
+            attachment = att_row['filename'] if att_row else None
+
+            conn.close()
+            return text, msg_date, attachment
 
         except sqlite3.DatabaseError as e:
             if "malformed" in str(e).lower() and attempt < 2:
@@ -215,10 +296,10 @@ def get_last_message() -> tuple[str | None, int | None]:
                 time.sleep(0.5)
                 continue
             logger.error(f"DB 错误: {e}")
-            return None, None
+            return None, None, None
         except Exception as e:
             logger.error(f"DB 访问异常: {e}")
-            return None, None
+            return None, None, None
         finally:
             for f in [tmp_db, tmp_wal, tmp_shm]:
                 if f and os.path.exists(f):
@@ -226,7 +307,7 @@ def get_last_message() -> tuple[str | None, int | None]:
                         os.remove(f)
                     except Exception:
                         pass
-    return None, None
+    return None, None, None
 
 # ── iMessage 发送 ─────────────────────────────────────────────────────────────
 async def send_imessage(message: str, recipient: str) -> None:
@@ -271,14 +352,41 @@ async def send_chunked_message(text: str, recipient: str, model_name: str) -> No
         await send_imessage(prefix + chunk.strip(), recipient)
         await asyncio.sleep(0.5)
 
+# ── 进度通知 ──────────────────────────────────────────────────────────────────
+async def progress_notifier(model_type: str, recipient: str, stop_event: asyncio.Event):
+    """每 PROGRESS_INTERVAL 秒发一条进度消息，直到任务完成"""
+    await asyncio.sleep(PROGRESS_INTERVAL)
+    while not stop_event.is_set():
+        elapsed = int(time.time() - app_state.task_start_time)
+        await send_imessage(f"⏳ {model_type.upper()} 思考中... ({elapsed}s)", recipient)
+        await asyncio.sleep(PROGRESS_INTERVAL)
+
 # ── AI 任务执行 ───────────────────────────────────────────────────────────────
-async def run_ai_task(model_type: str, content: str, recipient: str) -> None:
+async def run_ai_task(model_type: str, content: str, recipient: str,
+                      attachment: str | None = None) -> None:
     app_state.is_running      = True
     app_state.task_start_time = time.time()
-    logger.info(f"▶️ [{model_type}] {content}")
+    converted_img             = None
+    logger.info(f"▶️ [{model_type}] {content}" + (f" [图片]" if attachment else ""))
 
-    # 记录用户消息
+    # ── 1. 联网搜索增强 ────────────────────────────────────────────────────────
+    search_prefix = ""
+    if should_search(content):
+        logger.info(f"🔍 触发联网搜索: {content[:50]}")
+        await send_imessage("🔍 正在联网搜索...", recipient)
+        search_result = await tavily_search(content)
+        if search_result:
+            search_prefix = search_result
+            logger.info("✅ 搜索结果已附加")
+
+    # ── 2. 记录用户消息 ────────────────────────────────────────────────────────
     memory.add(model_type, "user", content)
+
+    # ── 3. 启动进度通知 ────────────────────────────────────────────────────────
+    stop_event    = asyncio.Event()
+    progress_task = asyncio.create_task(
+        progress_notifier(model_type, recipient, stop_event)
+    )
 
     try:
         path = CLI_PATHS.get(model_type)
@@ -286,29 +394,37 @@ async def run_ai_task(model_type: str, content: str, recipient: str) -> None:
             await send_imessage(f"❌ 未找到 {model_type} 路径: {path}", recipient)
             return
 
-        # ── 构建命令（含记忆逻辑）────────────────────────────────────────────
+        # ── 4. 构建 prompt ────────────────────────────────────────────────────
+        # 处理图片附件
+        img_note = ""
+        if attachment:
+            converted_img = prepare_image(attachment)
+            if converted_img:
+                img_note = f"[用户发送了图片: {converted_img}]\n"
+                logger.info(f"🖼️ 附件就绪: {converted_img}")
+
+        full_content = f"{search_prefix}{img_note}{content}"
+
+        # ── 5. 构建命令（含记忆逻辑）─────────────────────────────────────────
         if model_type == "claude":
-            # --continue 自动续接上次会话；无历史时不加，避免误接其他会话
             if memory.has_session("claude"):
-                cmd = [path, "-p", content, "--continue"]
+                cmd = [path, "-p", full_content, "--continue"]
             else:
-                cmd = [path, "-p", content]
+                cmd = [path, "-p", full_content]
 
         elif model_type == "gemini":
-            # --resume latest 续接上次 Gemini 会话
             if memory.has_session("gemini"):
-                cmd = [path, "-p", content, "--resume", "latest"]
+                cmd = [path, "-p", full_content, "--resume", "latest"]
             else:
-                cmd = [path, "-p", content]
+                cmd = [path, "-p", full_content]
 
         elif model_type == "codex":
-            # Codex 不支持原生会话续接，手动拼接历史上下文
-            ctx = memory.get_context("codex")
-            full_prompt = f"{ctx}{content}" if ctx else content
+            ctx         = memory.get_context("codex")
+            full_prompt = f"{ctx}{full_content}" if ctx else full_content
             cmd = [path, "exec", full_prompt, "--skip-git-repo-check", "--full-auto"]
 
         else:
-            cmd = [path, content]
+            cmd = [path, full_content]
 
         env             = os.environ.copy()
         env["NO_COLOR"] = "1"
@@ -334,15 +450,14 @@ async def run_ai_task(model_type: str, content: str, recipient: str) -> None:
             return
 
         if app_state.current_process.returncode in (-15, -9):
-            return  # 用户主动中断
+            return
 
         raw    = stdout.decode('utf-8', errors='ignore') if stdout else \
                  stderr.decode('utf-8', errors='ignore') if stderr else ""
         output = strip_ansi(raw).strip()
 
         if output:
-            # 记录 AI 回复到历史
-            memory.add(model_type, "assistant", output[:500])  # 只存前 500 字，节省空间
+            memory.add(model_type, "assistant", output[:500])
             await send_chunked_message(output, recipient, model_type)
         else:
             await send_imessage(f"⚠️ {model_type} 返回了空结果", recipient)
@@ -351,14 +466,22 @@ async def run_ai_task(model_type: str, content: str, recipient: str) -> None:
         logger.error(f"执行异常: {e}")
         await send_imessage(f"⚠️ 脚本异常: {e}", recipient)
     finally:
+        stop_event.set()
+        progress_task.cancel()
         app_state.is_running      = False
         app_state.current_process = None
+        # 清理临时转换的图片
+        if converted_img and converted_img != attachment:
+            try:
+                os.remove(converted_img)
+            except Exception:
+                pass
 
 # ── 任务队列消费者 ─────────────────────────────────────────────────────────────
 async def queue_worker() -> None:
     while True:
-        model, content, recipient = await app_state.task_queue.get()
-        await run_ai_task(model, content, recipient)
+        model, content, recipient, attachment = await app_state.task_queue.get()
+        await run_ai_task(model, content, recipient, attachment)
         app_state.task_queue.task_done()
 
 # ── 主循环 ────────────────────────────────────────────────────────────────────
@@ -367,28 +490,34 @@ async def main() -> None:
         logger.error("❌ SENDER_IDS 未配置，请检查 .env 文件")
         return
 
-    logger.info(f"🚀 启动！默认模型: {app_state.selected_model} | 安全口令: {'已启用' if BRIDGE_SECRET else '⚠️ 未启用'}")
+    logger.info(f"🚀 启动！默认模型: {app_state.selected_model} | "
+                f"安全口令: {'已启用' if BRIDGE_SECRET else '⚠️ 未启用'} | "
+                f"Tavily: {'✅' if TAVILY_API_KEY else '❌'}")
     for m in ("claude", "gemini", "codex"):
         logger.info(f"   [{m}] {memory.summary(m)}")
 
     asyncio.create_task(queue_worker())
 
-    _, last_date = get_last_message()
+    _, last_date, _ = get_last_message()
     app_state.last_message_date = last_date or 0
 
     while True:
         try:
-            content, msg_date = get_last_message()
+            content, msg_date, attachment = get_last_message()
 
             if msg_date and msg_date > app_state.last_message_date:
                 app_state.last_message_date = msg_date
 
-                if not content:
+                # 纯图片消息（无文字）也处理
+                if not content and not attachment:
                     await asyncio.sleep(1)
                     continue
 
-                content = content.strip()
-                logger.info(f"📥 {content}")
+                content = (content or "").strip()
+                if not content and attachment:
+                    content = "请描述这张图片"
+
+                logger.info(f"📥 {content}" + (f" [📎{os.path.basename(attachment)}]" if attachment else ""))
 
                 # ── 口令验证 ──────────────────────────────────────────────────
                 ok, content = verify_secret(content)
@@ -422,14 +551,14 @@ async def main() -> None:
                         await send_imessage("🏓 Pong!", SENDER_ID)
 
                     elif cmd_lower == "/status":
-                        msg = f"🤖 当前模型: {app_state.selected_model.upper()}\n"
-                        if app_state.is_running:
-                            elapsed = int(time.time() - app_state.task_start_time)
-                            msg += f"⏳ 执行中... ({elapsed}s)\n"
-                        else:
-                            msg += "💤 空闲\n"
-                        msg += f"📋 队列: {app_state.task_queue.qsize()} 条待处理\n"
-                        msg += f"💬 {app_state.selected_model}: {memory.summary(app_state.selected_model)}"
+                        search_status = "✅ 已启用" if TAVILY_API_KEY else "❌ 未配置"
+                        msg = (
+                            f"🤖 当前模型: {app_state.selected_model.upper()}\n"
+                            f"{'⏳ 执行中... (' + str(int(time.time()-app_state.task_start_time)) + 's)' if app_state.is_running else '💤 空闲'}\n"
+                            f"📋 队列: {app_state.task_queue.qsize()} 条待处理\n"
+                            f"💬 {app_state.selected_model}: {memory.summary(app_state.selected_model)}\n"
+                            f"🔍 联网搜索: {search_status}"
+                        )
                         await send_imessage(msg, SENDER_ID)
 
                     elif cmd_lower == "/stop":
@@ -442,7 +571,7 @@ async def main() -> None:
 
                     elif cmd_lower == "/reset":
                         memory.reset(app_state.selected_model)
-                        await send_imessage(f"🗑️ 已清空 {app_state.selected_model.upper()} 对话历史，开始新会话", SENDER_ID)
+                        await send_imessage(f"🗑️ 已清空 {app_state.selected_model.upper()} 对话历史", SENDER_ID)
 
                     elif cmd_lower == "/reset all":
                         memory.reset_all()
@@ -477,7 +606,7 @@ async def main() -> None:
                     continue
 
                 # ── 入队执行 ──────────────────────────────────────────────────
-                await app_state.task_queue.put((app_state.selected_model, content, SENDER_ID))
+                await app_state.task_queue.put((app_state.selected_model, content, SENDER_ID, attachment))
                 queue_size = app_state.task_queue.qsize()
                 if queue_size > 1:
                     await send_imessage(f"📋 已加入队列（前方还有 {queue_size-1} 条）", SENDER_ID)
