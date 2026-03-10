@@ -23,9 +23,11 @@ CLI_PATHS = {
 }
 
 # ── 行为 ──────────────────────────────────────
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude")
-TASK_TIMEOUT  = int(os.getenv("TASK_TIMEOUT", "300"))
-CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "2000"))
+DEFAULT_MODEL  = os.getenv("DEFAULT_MODEL", "claude")
+TASK_TIMEOUT   = int(os.getenv("TASK_TIMEOUT", "300"))
+CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "2000"))
+MEMORY_TURNS   = int(os.getenv("MEMORY_TURNS", "10"))   # 每个模型保留最近 N 轮对话
+MEMORY_DIR     = os.path.expanduser("~/.claude_bridge/memory")
 
 # ── PATH 补全（launchd 环境变量不完整时） ───────
 ROBUST_PATH = (
