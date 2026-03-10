@@ -311,7 +311,7 @@ def get_last_message() -> tuple[str | None, int | None, str | None]:
 
 # ── iMessage 发送 ─────────────────────────────────────────────────────────────
 async def send_imessage(message: str, recipient: str) -> None:
-    safe = message.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
+    safe = message.replace('\\', '\\\\').replace('"', '\\"')
     script = f'tell application "Messages" to send "{safe}" to buddy "{recipient}"'
     try:
         proc = await asyncio.create_subprocess_exec(
