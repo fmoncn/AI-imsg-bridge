@@ -10,7 +10,8 @@ import shutil
 import subprocess
 import aiohttp
 from logging.handlers import RotatingFileHandler
-from dingtalk_stream import ChatbotHandler, DingTalkStreamClient, Credential, AckMessage
+from dingtalk_stream import DingTalkStreamClient, Credential, AckMessage
+from dingtalk_stream.chatbot import ChatbotHandler, ChatbotMessage
 
 from config import (
     BRIDGE_SECRET, SENDER_IDS, SENDER_ID,
@@ -133,17 +134,19 @@ class DingTalkAdapter:
     """钉钉 Stream 模式适配器（无需公网 IP）"""
 
     def __init__(self):
-        self._conv_id: str | None   = None  # 最近会话 ID，用于回复
-        self._token: str | None     = None  # 缓存 access token
-        self._token_expire: float   = 0.0   # token 过期时间戳
+        self._conv_id: str | None      = None  # 最近会话 ID（群聊用）
+        self._conv_type: str           = "1"   # "1"=单聊 "2"=群聊
+        self._sender_id: str | None    = None  # 发送者 staffId（单聊回复用）
+        self._token: str | None        = None  # 缓存 access token
+        self._token_expire: float      = 0.0   # token 过期时间戳
 
     async def start(self):
         """在线程池中启动 Stream 长连接，不阻塞 asyncio"""
-        handler    = _DingTalkHandler(self)
+        loop       = asyncio.get_event_loop()
+        handler    = _DingTalkHandler(self, loop)
         credential = Credential(DINGTALK_CLIENT_ID, DINGTALK_CLIENT_SECRET)
         client     = DingTalkStreamClient(credential)
-        client.register_callback_handler(handler)
-        loop = asyncio.get_event_loop()
+        client.register_callback_handler("/v1.0/im/bot/messages/get", handler)
         logger.info("📱 钉钉 Stream 连接中...")
         await loop.run_in_executor(None, client.start_forever)
 
@@ -167,58 +170,83 @@ class DingTalkAdapter:
             return None
 
     async def send(self, message: str, recipient: str):
-        """发送消息到钉钉会话"""
-        conv_id = self._conv_id
-        if not conv_id:
-            logger.error("钉钉：无会话 ID，无法发送")
-            return
+        """发送消息：单聊用 oToMessages，群聊用 groupMessages"""
         token = await self._get_token()
         if not token:
             return
+        headers = {"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"}
+        msg_param = json.dumps({"content": message}, ensure_ascii=False)
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    "https://api.dingtalk.com/v1.0/robot/groupMessages/send",
-                    json={
+                if self._conv_type == "2":
+                    # 群聊
+                    if not self._conv_id:
+                        logger.error("钉钉：无群聊 ID")
+                        return
+                    url     = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+                    payload = {
+                        "robotCode":          DINGTALK_CLIENT_ID,
+                        "openConversationId": self._conv_id,
+                        "msgKey":             "sampleText",
+                        "msgParam":           msg_param,
+                    }
+                else:
+                    # 单聊（默认）
+                    if not self._sender_id:
+                        logger.error("钉钉：无 sender_id")
+                        return
+                    url     = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+                    payload = {
                         "robotCode": DINGTALK_CLIENT_ID,
-                        "openConversationId": conv_id,
-                        "msgKey": "sampleText",
-                        "msgParam": json.dumps({"content": message}, ensure_ascii=False),
-                    },
-                    headers={"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
+                        "userIds":   [self._sender_id],
+                        "msgKey":    "sampleText",
+                        "msgParam":  msg_param,
+                    }
+                async with s.post(url, json=payload, headers=headers,
+                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status != 200:
                         logger.error(f"钉钉发送失败 {r.status}: {await r.text()}")
+                    else:
+                        logger.info(f"✅ 钉钉回复成功 (type={self._conv_type})")
         except Exception as e:
             logger.error(f"钉钉发送异常: {e}")
 
 
 class _DingTalkHandler(ChatbotHandler):
-    """钉钉消息事件处理器"""
+    """钉钉消息事件处理器（运行在线程池，需桥接到主 asyncio 循环）"""
 
-    def __init__(self, adapter: DingTalkAdapter):
+    def __init__(self, adapter: DingTalkAdapter, loop: asyncio.AbstractEventLoop):
         super().__init__()
         self.adapter = adapter
+        self.loop    = loop  # 主事件循环引用
 
     async def process(self, callback):
-        data    = callback.data
-        text    = (data.get("text") or {}).get("content", "").strip()
-        conv_id = data.get("openConversationId") or data.get("conversationId", "")
-        sender  = data.get("senderStaffId", "dingtalk_user")
+        msg     = ChatbotMessage.from_dict(callback.data)
+        text    = msg.text.content.strip() if msg.text else ""
+        conv_id = msg.conversation_id or ""
+        sender  = msg.sender_staff_id or msg.sender_id or "dingtalk_user"
+        conv_type = str(msg.conversation_type or "1")
 
-        # 存储会话 ID，供后续回复使用
-        self.adapter._conv_id = conv_id
+        # 存储会话信息供回复使用
+        self.adapter._conv_id   = conv_id
+        self.adapter._conv_type = conv_type
+        self.adapter._sender_id = sender
         logger.info(f"📥 [钉钉] {sender}: {text}")
 
         if text:
             ok, content = verify_secret(text)
             if not ok:
-                await self.adapter.send("🔒 未授权", sender)
-                return AckMessage.success()
-            await app_state.task_queue.put((app_state.selected_model, content, sender, None))
+                asyncio.run_coroutine_threadsafe(
+                    self.adapter.send("🔒 未授权", sender), self.loop
+                )
+                return AckMessage.STATUS_OK, "OK"
+            # 线程安全地投递到主事件循环的队列
+            asyncio.run_coroutine_threadsafe(
+                app_state.task_queue.put((app_state.selected_model, content, sender, None)),
+                self.loop,
+            )
 
-        return AckMessage.success()
+        return AckMessage.STATUS_OK, "OK"
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
