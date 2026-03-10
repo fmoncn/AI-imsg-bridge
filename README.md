@@ -14,7 +14,7 @@
 
 [English](#english) · [中文](#中文)
 
-<img width="900" alt="architecture" src="https://raw.githubusercontent.com/fmoncn/AI-imsg-bridge/main/assets/demo.png">
+<img width="900" alt="architecture" src="https://raw.githubusercontent.com/fmoncn/AI-imsg-bridge/main/assets/demo.png?v=2">
 
 </div>
 
