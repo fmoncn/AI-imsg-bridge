@@ -4,16 +4,17 @@
 
 **Turn your iPhone into an AI Supercomputer — No App, No Subscription, No Cloud.**
 
-*用 iMessage 控制本地三大 AI，彻底替代 OpenClaw*
+*iMessage & 钉钉 × Claude × Gemini × Codex — 本地运行，零云端依赖*
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python)](https://python.org)
 [![macOS](https://img.shields.io/badge/macOS-12+-black?style=flat-square&logo=apple)](https://apple.com/macos)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 [![Models](https://img.shields.io/badge/Models-Claude%20%7C%20Gemini%20%7C%20Codex-purple?style=flat-square)](https://github.com/fmoncn/AI-imsg-bridge)
+[![Platform](https://img.shields.io/badge/Platform-iMessage%20%7C%20DingTalk-orange?style=flat-square)](https://github.com/fmoncn/AI-imsg-bridge)
 
 [English](#english) · [中文](#中文)
 
-<img width="600" alt="demo" src="https://raw.githubusercontent.com/fmoncn/AI-imsg-bridge/main/assets/demo.png">
+<img width="900" alt="architecture" src="https://raw.githubusercontent.com/fmoncn/AI-imsg-bridge/main/assets/demo.png">
 
 </div>
 
