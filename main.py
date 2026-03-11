@@ -115,12 +115,15 @@ memory = ConversationMemory()
 # ── 状态 ──────────────────────────────────────────────────────────────────────
 class AppState:
     def __init__(self):
-        self.is_running        = False
-        self.current_process   = None
-        self.last_message_date = 0
-        self.task_start_time   = 0.0
-        self.selected_model    = DEFAULT_MODEL
-        self.task_queue        = asyncio.Queue()
+        self.is_running            = False
+        self.current_process       = None
+        self.last_message_date     = 0
+        self.task_start_time       = 0.0
+        self.start_time            = time.time()   # bridge 启动时间（运行时长用）
+        self.selected_model        = DEFAULT_MODEL
+        self.task_queue            = asyncio.Queue()
+        self.gemini_timeout_count  = 0  # 连续超时次数（>=2 自动重置历史）
+        self.db_error_count        = 0  # 连续 DB 异常次数（>=5 自愈重启）
 
 app_state = AppState()
 
@@ -313,22 +316,26 @@ def get_last_message() -> tuple[str | None, int | None, str | None]:
 async def send_imessage(message: str, recipient: str) -> None:
     safe = message.replace('\\', '\\\\').replace('"', '\\"')
     script = f'tell application "Messages" to send "{safe}" to buddy "{recipient}"'
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode != 0:
+    for attempt in range(3):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0:
+                logger.info("✅ iMessage 已发送")
+                return
             err = stderr.decode('utf-8', errors='ignore').strip()
-            logger.error(f"iMessage 发送失败 (code={proc.returncode}): {err}")
-        else:
-            logger.info("✅ iMessage 已发送")
-    except asyncio.TimeoutError:
-        logger.error("iMessage 发送超时（>15s）")
-    except Exception as e:
-        logger.error(f"iMessage 发送异常: {e}")
+            logger.warning(f"iMessage 发送失败 (attempt {attempt+1}, code={proc.returncode}): {err}")
+        except asyncio.TimeoutError:
+            logger.warning(f"iMessage 发送超时 (attempt {attempt+1})")
+        except Exception as e:
+            logger.warning(f"iMessage 发送异常 (attempt {attempt+1}): {e}")
+        if attempt < 2:
+            await asyncio.sleep(2)
+    logger.error("iMessage 发送彻底失败（3次均未成功）")
 
 
 # ── 工程心跳 ──────────────────────────────────────────────────────────────────
@@ -399,6 +406,19 @@ async def progress_notifier(model_type: str, recipient: str, stop_event: asyncio
         await send_imessage(f"⏳ {model_type.upper()} 思考中... ({elapsed}s)", recipient)
         await asyncio.sleep(PROGRESS_INTERVAL)
 
+# ── 任务超时分级 ──────────────────────────────────────────────────────────────
+_CODE_KEYWORDS = re.compile(
+    r'代码|程序|函数|脚本|写|开发|实现|调试|debug|fix|bug|code|script|function|class|api',
+    re.IGNORECASE,
+)
+
+def get_task_timeout(content: str, has_search: bool) -> int:
+    if _CODE_KEYWORDS.search(content):
+        return 300
+    if has_search:
+        return 90
+    return 60
+
 # ── AI 任务执行 ───────────────────────────────────────────────────────────────
 async def run_ai_task(model_type: str, content: str, recipient: str,
                       attachment: str | None = None) -> None:
@@ -409,7 +429,8 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
 
     # ── 1. 联网搜索增强 ────────────────────────────────────────────────────────
     search_prefix = ""
-    if should_search(content):
+    has_search = should_search(content)
+    if has_search:
         logger.info(f"🔍 触发联网搜索: {content[:50]}")
         await send_imessage("🔍 正在联网搜索...", recipient)
         search_result = await tavily_search(content)
@@ -452,7 +473,44 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
 
         elif model_type == "gemini":
             if memory.has_session("gemini"):
-                cmd = [path, "-y", "-p", full_content, "--resume", "latest"]
+                # 先用 30s 短超时探测 --resume，失败则降级为新会话
+                probe_cmd = [path, "-y", "-p", full_content, "--resume", "latest"]
+                app_state.current_process = await asyncio.create_subprocess_exec(
+                    *probe_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        app_state.current_process.communicate(), timeout=30
+                    )
+                    if app_state.current_process.returncode not in (-15, -9):
+                        raw    = stdout.decode('utf-8', errors='ignore') if stdout else \
+                                 stderr.decode('utf-8', errors='ignore') if stderr else ""
+                        output = strip_ansi(raw).strip()
+                        app_state.gemini_timeout_count = 0
+                        if output:
+                            memory.add(model_type, "assistant", output[:500])
+                            await send_chunked_message(output, recipient, model_type)
+                        else:
+                            await send_imessage("⚠️ gemini 返回了空结果", recipient)
+                        return
+                except asyncio.TimeoutError:
+                    if app_state.current_process:
+                        app_state.current_process.kill()
+                    app_state.gemini_timeout_count += 1
+                    logger.warning(f"Gemini --resume 探测超时（第{app_state.gemini_timeout_count}次）")
+                    if app_state.gemini_timeout_count >= 2:
+                        memory.reset("gemini")
+                        app_state.gemini_timeout_count = 0
+                        logger.warning("Gemini 连续超时 2 次，已自动重置历史")
+                        await send_imessage("⚠️ Gemini 会话异常，已自动重置历史，重新开始", recipient)
+                    else:
+                        await send_imessage("⚠️ Gemini 会话恢复超时，降级为新会话重试", recipient)
+                    cmd = [path, "-y", "-p", full_content]
+                else:
+                    cmd = [path, "-y", "-p", full_content]
             else:
                 cmd = [path, "-y", "-p", full_content]
 
@@ -476,15 +534,16 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
             env=env,
         )
 
+        timeout = get_task_timeout(content, has_search)
         try:
             stdout, stderr = await asyncio.wait_for(
                 app_state.current_process.communicate(),
-                timeout=TASK_TIMEOUT,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             if app_state.current_process:
                 app_state.current_process.kill()
-            await send_imessage(f"⚠️ {model_type} 任务超时（>{TASK_TIMEOUT}s）", recipient)
+            await send_imessage(f"⚠️ {model_type} 任务超时（>{timeout}s）", recipient)
             return
 
         if app_state.current_process.returncode in (-15, -9):
@@ -540,9 +599,16 @@ async def main() -> None:
     _, last_date, _ = get_last_message()
     app_state.last_message_date = last_date or 0
 
+    # 启动通知
+    await send_imessage(
+        f"🚀 Bridge 已启动 | 模型: {app_state.selected_model.upper()} | {time.strftime('%H:%M')}",
+        SENDER_ID,
+    )
+
     while True:
         try:
             content, msg_date, attachment = get_last_message()
+            app_state.db_error_count = 0  # 成功读取则重置计数
 
             if msg_date and msg_date > app_state.last_message_date:
                 app_state.last_message_date = msg_date
@@ -591,9 +657,14 @@ async def main() -> None:
 
                     elif cmd_lower == "/status":
                         search_status = "✅ 已启用" if TAVILY_API_KEY else "❌ 未配置"
+                        uptime_sec = int(time.time() - app_state.start_time)
+                        h, r = divmod(uptime_sec, 3600)
+                        m, s = divmod(r, 60)
+                        uptime_str = f"{h}小时{m}分{s}秒" if h else f"{m}分{s}秒"
                         msg = (
                             f"🤖 当前模型: {app_state.selected_model.upper()}\n"
                             f"{'⏳ 执行中... (' + str(int(time.time()-app_state.task_start_time)) + 's)' if app_state.is_running else '💤 空闲'}\n"
+                            f"⏱️ 运行时长: {uptime_str}\n"
                             f"📋 队列: {app_state.task_queue.qsize()} 条待处理\n"
                             f"💬 {app_state.selected_model}: {memory.summary(app_state.selected_model)}\n"
                             f"🔍 联网搜索: {search_status}"
@@ -652,6 +723,12 @@ async def main() -> None:
 
         except Exception as e:
             logger.error(f"主循环异常: {e}")
+            app_state.db_error_count += 1
+            if app_state.db_error_count >= 5:
+                logger.error("连续 5 次异常，自愈重启进程...")
+                await send_imessage("⚠️ Bridge 检测到持续异常，正在自愈重启...", SENDER_ID)
+                await asyncio.sleep(2)
+                os.execv(__file__, [__file__])
 
         await asyncio.sleep(1)
 
