@@ -527,6 +527,7 @@ _BRIDGE_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _BRIDGE_CONTEXT_PATH = os.path.expanduser("~/.claude_bridge/BRIDGE.md")
+_USER_CONTEXT_PATH   = os.path.expanduser("~/.claude_bridge/USER.md")
 
 def get_task_timeout(content: str, has_search: bool) -> int:
     if _CODE_KEYWORDS.search(content):
@@ -536,17 +537,30 @@ def get_task_timeout(content: str, has_search: bool) -> int:
     return 60
 
 def load_bridge_context(content: str) -> str:
-    """当消息涉及 bridge 修改/升级时，注入项目记忆文件"""
-    if not _BRIDGE_KEYWORDS.search(content):
-        return ""
+    """始终注入用户上下文；bridge 相关任务额外注入项目文件"""
+    parts = []
+    # 用户上下文：始终加载
     try:
-        if os.path.exists(_BRIDGE_CONTEXT_PATH):
-            with open(_BRIDGE_CONTEXT_PATH) as f:
-                ctx = f.read()
-            logger.info("📎 注入 BRIDGE.md 项目上下文")
-            return f"[项目上下文]\n{ctx}\n[以上为项目背景，请基于此作答]\n\n"
+        if os.path.exists(_USER_CONTEXT_PATH):
+            with open(_USER_CONTEXT_PATH) as f:
+                parts.append(f.read())
     except Exception as e:
-        logger.warning(f"加载 BRIDGE.md 失败: {e}")
+        logger.warning(f"加载 USER.md 失败: {e}")
+
+    # 项目上下文：仅 bridge 相关任务加载
+    if _BRIDGE_KEYWORDS.search(content):
+        try:
+            if os.path.exists(_BRIDGE_CONTEXT_PATH):
+                with open(_BRIDGE_CONTEXT_PATH) as f:
+                    parts.append(f.read())
+                logger.info("📎 注入 BRIDGE.md 项目上下文")
+        except Exception as e:
+            logger.warning(f"加载 BRIDGE.md 失败: {e}")
+
+    if parts:
+        logger.info("📎 注入用户上下文")
+        combined = "\n\n---\n\n".join(parts)
+        return f"[系统上下文]\n{combined}\n[以上为背景信息，请基于此作答]\n\n"
     return ""
 
 # ── AI 任务执行 ───────────────────────────────────────────────────────────────
