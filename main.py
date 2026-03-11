@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import os
+import signal
 import time
 import re
 import json
@@ -239,6 +240,50 @@ def prepare_image(raw_path: str) -> str | None:
     return path  # PNG / GIF / JPEG 直接返回
 
 
+# ── 孤儿进程清理 ──────────────────────────────────────────────────────────────
+def kill_orphan_processes() -> list[int]:
+    """启动时清理上次 bridge 崩溃留下的 CLI 子进程"""
+    killed = []
+    cli_paths = [p for p in CLI_PATHS.values() if p]
+    try:
+        result = subprocess.run(["ps", "aux"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            for cli_path in cli_paths:
+                if cli_path in line:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        try:
+                            pid = int(parts[1])
+                            if pid != os.getpid():
+                                os.kill(pid, signal.SIGTERM)
+                                killed.append(pid)
+                                logger.info(f"🧹 清理孤儿进程 PID={pid}")
+                        except (ValueError, ProcessLookupError):
+                            pass
+    except Exception as e:
+        logger.warning(f"孤儿进程清理失败: {e}")
+    return killed
+
+
+# ── stderr 日志轮转 ───────────────────────────────────────────────────────────
+def rotate_stderr_log() -> None:
+    """启动时检查 launch_stderr.log，超过 5MB 则截断保留最后 1MB"""
+    stderr_log = os.path.join(LOG_DIR, "launch_stderr.log")
+    max_size   = 5 * 1024 * 1024
+    keep_size  = 1 * 1024 * 1024
+    try:
+        if os.path.exists(stderr_log) and os.path.getsize(stderr_log) > max_size:
+            with open(stderr_log, "rb") as f:
+                f.seek(-keep_size, 2)
+                tail = f.read()
+            with open(stderr_log, "wb") as f:
+                f.write(b"[... truncated at startup, keeping last 1MB ...]\n")
+                f.write(tail)
+            logger.info("📋 launch_stderr.log 已截断（超过 5MB）")
+    except Exception as e:
+        logger.warning(f"stderr 日志截断失败: {e}")
+
+
 # ── 数据库（含附件查询）─────────────────────────────────────────────────────
 def get_last_message() -> tuple[str | None, int | None, str | None]:
     """返回 (文本内容, 日期戳, 附件路径 or None)"""
@@ -421,7 +466,8 @@ def get_task_timeout(content: str, has_search: bool) -> int:
 
 # ── AI 任务执行 ───────────────────────────────────────────────────────────────
 async def run_ai_task(model_type: str, content: str, recipient: str,
-                      attachment: str | None = None) -> None:
+                      attachment: str | None = None,
+                      restore_model: str | None = None) -> None:
     app_state.is_running      = True
     app_state.task_start_time = time.time()
     converted_img             = None
@@ -567,6 +613,10 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
         progress_task.cancel()
         app_state.is_running      = False
         app_state.current_process = None
+        # 图片路由：恢复原模型
+        if restore_model and app_state.selected_model != restore_model:
+            app_state.selected_model = restore_model
+            await send_imessage(f"🔄 已恢复至 {restore_model.upper()}", recipient)
         # 清理临时转换的图片
         if converted_img and converted_img != attachment:
             try:
@@ -577,8 +627,10 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
 # ── 任务队列消费者 ─────────────────────────────────────────────────────────────
 async def queue_worker() -> None:
     while True:
-        model, content, recipient, attachment = await app_state.task_queue.get()
-        await run_ai_task(model, content, recipient, attachment)
+        item = await app_state.task_queue.get()
+        model, content, recipient, attachment = item[:4]
+        restore_model = item[4] if len(item) > 4 else None
+        await run_ai_task(model, content, recipient, attachment, restore_model)
         app_state.task_queue.task_done()
 
 # ── 主循环 ────────────────────────────────────────────────────────────────────
@@ -591,6 +643,12 @@ async def main() -> None:
 
     asyncio.create_task(queue_worker())
     asyncio.create_task(heartbeat())
+
+    # 启动清理
+    rotate_stderr_log()
+    killed = kill_orphan_processes()
+    if killed:
+        logger.info(f"🧹 已清理 {len(killed)} 个孤儿进程")
 
     if not SENDER_IDS:
         logger.error("❌ SENDER_IDS 未配置，请检查 .env 文件")
@@ -715,8 +773,27 @@ async def main() -> None:
                     await asyncio.sleep(1)
                     continue
 
-                # ── 入队执行 ──────────────────────────────────────────────────
-                await app_state.task_queue.put((app_state.selected_model, content, SENDER_ID, attachment))
+                # ── 消息长度保护 ───────────────────────────────────────────
+                MAX_MSG_LEN = 8000
+                if len(content) > MAX_MSG_LEN:
+                    await send_imessage(
+                        f"⚠️ 消息过长（{len(content)} 字），已截取前 {MAX_MSG_LEN} 字处理", SENDER_ID
+                    )
+                    content = content[:MAX_MSG_LEN]
+
+                # ── 图片自动路由 Gemini ────────────────────────────────────
+                target_model  = app_state.selected_model
+                restore_model = None
+                if attachment and target_model != "gemini":
+                    restore_model = target_model
+                    target_model  = "gemini"
+                    logger.info(f"🖼️ 图片消息自动路由至 Gemini（原模型: {restore_model}）")
+                    await send_imessage(
+                        f"🖼️ 图片已路由至 Gemini 处理，完成后恢复 {restore_model.upper()}", SENDER_ID
+                    )
+
+                # ── 入队执行 ──────────────────────────────────────────────
+                await app_state.task_queue.put((target_model, content, SENDER_ID, attachment, restore_model))
                 queue_size = app_state.task_queue.qsize()
                 if queue_size > 1:
                     await send_imessage(f"📋 已加入队列（前方还有 {queue_size-1} 条）", SENDER_ID)
