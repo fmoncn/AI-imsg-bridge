@@ -510,6 +510,11 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
 
         full_content = f"{search_prefix}{img_note}{content}"
 
+        env             = os.environ.copy()
+        env["NO_COLOR"] = "1"
+        env["TERM"]     = "dumb"
+        env["PATH"]     = f"{ROBUST_PATH}:{env.get('PATH', '')}"
+
         # ── 5. 构建命令（含记忆逻辑）─────────────────────────────────────────
         if model_type == "claude":
             if memory.has_session("claude"):
@@ -567,11 +572,6 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
 
         else:
             cmd = [path, full_content]
-
-        env             = os.environ.copy()
-        env["NO_COLOR"] = "1"
-        env["TERM"]     = "dumb"
-        env["PATH"]     = f"{ROBUST_PATH}:{env.get('PATH', '')}"
 
         app_state.current_process = await asyncio.create_subprocess_exec(
             *cmd,
