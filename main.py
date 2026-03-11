@@ -128,6 +128,73 @@ class AppState:
 
 app_state = AppState()
 
+# ── 模型健康追踪 ───────────────────────────────────────────────────────────────
+_QUOTA_PATTERN = re.compile(
+    r'quota|rate.?limit|429|resource.?exhausted|too.?many.?request|limit.?exceed|'
+    r'billing|payment|subscription|insufficient|capacity',
+    re.IGNORECASE,
+)
+_FALLBACK_CHAIN = {
+    "gemini": ["claude", "codex"],
+    "claude": ["gemini", "codex"],
+    "codex":  ["claude", "gemini"],
+}
+
+class ModelHealth:
+    def __init__(self):
+        self._success:       dict[str, int]   = {m: 0 for m in ("claude", "gemini", "codex")}
+        self._failure:       dict[str, int]   = {m: 0 for m in ("claude", "gemini", "codex")}
+        self._last_error:    dict[str, str]   = {}
+        self._disabled_until:dict[str, float] = {}
+
+    def is_quota_error(self, text: str) -> bool:
+        return bool(_QUOTA_PATTERN.search(text))
+
+    def is_available(self, model: str) -> bool:
+        until = self._disabled_until.get(model, 0)
+        if time.time() < until:
+            return False
+        if model in self._disabled_until:
+            del self._disabled_until[model]  # 自动解禁
+        return True
+
+    def record_success(self, model: str):
+        self._success[model] = self._success.get(model, 0) + 1
+        self._last_error.pop(model, None)
+
+    def record_failure(self, model: str, reason: str, quota: bool = False):
+        self._failure[model] = self._failure.get(model, 0) + 1
+        self._last_error[model] = reason[:40]
+        if quota:
+            self._disabled_until[model] = time.time() + 3600  # 禁用 1 小时
+            logger.warning(f"⛔ [{model}] 配额耗尽，禁用 1 小时")
+
+    def get_fallback(self, failed_model: str) -> str | None:
+        for m in _FALLBACK_CHAIN.get(failed_model, []):
+            if self.is_available(m):
+                return m
+        return None
+
+    def success_rate(self, model: str) -> str:
+        s = self._success.get(model, 0)
+        f = self._failure.get(model, 0)
+        total = s + f
+        if total == 0:
+            return "无数据"
+        return f"{int(s / total * 100)}%"
+
+    def status_line(self, model: str) -> str:
+        if not self.is_available(model):
+            remain = int((self._disabled_until.get(model, 0) - time.time()) / 60)
+            return f"⛔ 配额耗尽（{remain}分钟后恢复）"
+        f = self._failure.get(model, 0)
+        rate = self.success_rate(model)
+        last = self._last_error.get(model)
+        if f >= 3 and last:
+            return f"⚠️ 不稳定 | 成功率 {rate} | 最近: {last}"
+        return f"✅ 正常 | 成功率 {rate}"
+
+health = ModelHealth()
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 def decode_attributed_body(data: bytes | None) -> str | None:
@@ -589,6 +656,7 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
         except asyncio.TimeoutError:
             if app_state.current_process:
                 app_state.current_process.kill()
+            health.record_failure(model_type, "timeout")
             await send_imessage(f"⚠️ {model_type} 任务超时（>{timeout}s）", recipient)
             return
 
@@ -600,12 +668,29 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
         output = strip_ansi(raw).strip()
 
         if output:
+            # ── 配额耗尽检测 → 互救 ───────────────────────────────────────
+            if health.is_quota_error(output):
+                health.record_failure(model_type, "quota exhausted", quota=True)
+                fallback = health.get_fallback(model_type)
+                if fallback:
+                    logger.warning(f"🔄 [{model_type}] 配额耗尽，启动互救 → {fallback}")
+                    await send_imessage(
+                        f"⚠️ {model_type.upper()} 配额耗尽\n🔄 自动切换 {fallback.upper()} 重试...",
+                        recipient,
+                    )
+                    await run_ai_task(fallback, content, recipient, attachment)
+                else:
+                    await send_imessage("⛔ 所有模型配额耗尽，请稍后重试", recipient)
+                return
+            health.record_success(model_type)
             memory.add(model_type, "assistant", output[:500])
             await send_chunked_message(output, recipient, model_type)
         else:
+            health.record_failure(model_type, "empty response")
             await send_imessage(f"⚠️ {model_type} 返回了空结果", recipient)
 
     except Exception as e:
+        health.record_failure(model_type, str(e)[:40])
         logger.error(f"执行异常: {e}")
         await send_imessage(f"⚠️ 脚本异常: {e}", recipient)
     finally:
@@ -725,9 +810,25 @@ async def main() -> None:
                             f"⏱️ 运行时长: {uptime_str}\n"
                             f"📋 队列: {app_state.task_queue.qsize()} 条待处理\n"
                             f"💬 {app_state.selected_model}: {memory.summary(app_state.selected_model)}\n"
-                            f"🔍 联网搜索: {search_status}"
+                            f"🔍 联网搜索: {search_status}\n"
+                            f"📊 模型健康:\n"
+                            + "\n".join(
+                                f"{'▶' if m == app_state.selected_model else ' '} {m.upper()}: {health.status_line(m)}"
+                                for m in ("claude", "gemini", "codex")
+                            )
                         )
                         await send_imessage(msg, SENDER_ID)
+
+                    elif cmd_lower == "/health":
+                        lines = ["📊 模型健康详情："]
+                        for m in ("claude", "gemini", "codex"):
+                            mark = "▶" if m == app_state.selected_model else " "
+                            lines.append(f"{mark} {m.upper()}: {health.status_line(m)}")
+                        lines.append(f"\n🔄 互救链：")
+                        for m, chain in _FALLBACK_CHAIN.items():
+                            avail = [f for f in chain if health.is_available(f)]
+                            lines.append(f"  {m.upper()} → {'/'.join(avail).upper() if avail else '无可用备援'}")
+                        await send_imessage("\n".join(lines), SENDER_ID)
 
                     elif cmd_lower == "/stop":
                         proc = app_state.current_process
@@ -758,7 +859,8 @@ async def main() -> None:
                             "/c  → Claude Code\n"
                             "/g  → Gemini\n"
                             "/x  → Codex\n"
-                            "/status  → 状态\n"
+                            "/status  → 状态 + 模型健康\n"
+                            "/health  → 健康详情 + 互救链\n"
                             "/memory  → 记忆状态\n"
                             "/reset   → 清空当前模型历史\n"
                             "/reset all → 清空所有历史\n"
