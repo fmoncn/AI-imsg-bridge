@@ -319,9 +319,47 @@ async def send_imessage(message: str, recipient: str) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            err = stderr.decode('utf-8', errors='ignore').strip()
+            logger.error(f"iMessage 发送失败 (code={proc.returncode}): {err}")
+        else:
+            logger.info("✅ iMessage 已发送")
+    except asyncio.TimeoutError:
+        logger.error("iMessage 发送超时（>15s）")
     except Exception as e:
-        logger.error(f"iMessage 发送失败: {e}")
+        logger.error(f"iMessage 发送异常: {e}")
+
+
+# ── 工程心跳 ──────────────────────────────────────────────────────────────────
+async def heartbeat() -> None:
+    """每 30 分钟自检 iMessage 链路，00:00–08:00 静默不打扰"""
+    await asyncio.sleep(30 * 60)  # 启动后 30 分钟再首次检测
+    while True:
+        hour = time.localtime().tm_hour
+        if 0 <= hour < 8:
+            # 静默期：每 5 分钟再检查一次时间，直到 08:00
+            await asyncio.sleep(5 * 60)
+            continue
+        try:
+            ts = time.strftime("%H:%M")
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e",
+                f'tell application "Messages" to send "💓 Bridge 在线 | {ts}" to buddy "{SENDER_ID}"',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0:
+                logger.info(f"💓 心跳自检通过 ({ts})")
+            else:
+                err = stderr.decode('utf-8', errors='ignore').strip()
+                logger.error(f"💓 心跳自检失败: {err}")
+        except asyncio.TimeoutError:
+            logger.error("💓 心跳自检超时（>15s）")
+        except Exception as e:
+            logger.error(f"💓 心跳自检异常: {e}")
+        await asyncio.sleep(30 * 60)
 
 
 async def send_chunked_message(text: str, recipient: str, model_name: str) -> None:
@@ -493,6 +531,7 @@ async def main() -> None:
         logger.info(f"   [{m}] {memory.summary(m)}")
 
     asyncio.create_task(queue_worker())
+    asyncio.create_task(heartbeat())
 
     if not SENDER_IDS:
         logger.error("❌ SENDER_IDS 未配置，请检查 .env 文件")
