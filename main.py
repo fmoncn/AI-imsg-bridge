@@ -123,7 +123,6 @@ class AppState:
         self.start_time            = time.time()   # bridge 启动时间（运行时长用）
         self.selected_model        = DEFAULT_MODEL
         self.task_queue            = asyncio.Queue()
-        self.gemini_timeout_count  = 0  # 连续超时次数（>=2 自动重置历史）
         self.db_error_count        = 0  # 连续 DB 异常次数（>=5 自愈重启）
 
 app_state = AppState()
@@ -523,6 +522,11 @@ _CODE_KEYWORDS = re.compile(
     r'代码|程序|函数|脚本|写|开发|实现|调试|debug|fix|bug|code|script|function|class|api',
     re.IGNORECASE,
 )
+_BRIDGE_KEYWORDS = re.compile(
+    r'bridge|main\.py|config\.py|imessage|桥接|修复|升级|新功能|改一下|launchctl|功能|改进|优化',
+    re.IGNORECASE,
+)
+_BRIDGE_CONTEXT_PATH = os.path.expanduser("~/.claude_bridge/BRIDGE.md")
 
 def get_task_timeout(content: str, has_search: bool) -> int:
     if _CODE_KEYWORDS.search(content):
@@ -530,6 +534,20 @@ def get_task_timeout(content: str, has_search: bool) -> int:
     if has_search:
         return 90
     return 60
+
+def load_bridge_context(content: str) -> str:
+    """当消息涉及 bridge 修改/升级时，注入项目记忆文件"""
+    if not _BRIDGE_KEYWORDS.search(content):
+        return ""
+    try:
+        if os.path.exists(_BRIDGE_CONTEXT_PATH):
+            with open(_BRIDGE_CONTEXT_PATH) as f:
+                ctx = f.read()
+            logger.info("📎 注入 BRIDGE.md 项目上下文")
+            return f"[项目上下文]\n{ctx}\n[以上为项目背景，请基于此作答]\n\n"
+    except Exception as e:
+        logger.warning(f"加载 BRIDGE.md 失败: {e}")
+    return ""
 
 # ── AI 任务执行 ───────────────────────────────────────────────────────────────
 async def run_ai_task(model_type: str, content: str, recipient: str,
@@ -575,7 +593,8 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
                 img_note = f"[用户发送了图片: {converted_img}]\n"
                 logger.info(f"🖼️ 附件就绪: {converted_img}")
 
-        full_content = f"{search_prefix}{img_note}{content}"
+        bridge_ctx   = load_bridge_context(content)
+        full_content = f"{bridge_ctx}{search_prefix}{img_note}{content}"
 
         env             = os.environ.copy()
         env["NO_COLOR"] = "1"
@@ -590,47 +609,10 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
                 cmd = [path, "-p", full_content]
 
         elif model_type == "gemini":
-            if memory.has_session("gemini"):
-                # 先用 30s 短超时探测 --resume，失败则降级为新会话
-                probe_cmd = [path, "-y", "-p", full_content, "--resume", "latest"]
-                app_state.current_process = await asyncio.create_subprocess_exec(
-                    *probe_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        app_state.current_process.communicate(), timeout=30
-                    )
-                    if app_state.current_process.returncode not in (-15, -9):
-                        raw    = stdout.decode('utf-8', errors='ignore') if stdout else \
-                                 stderr.decode('utf-8', errors='ignore') if stderr else ""
-                        output = strip_ansi(raw).strip()
-                        app_state.gemini_timeout_count = 0
-                        if output:
-                            memory.add(model_type, "assistant", output[:500])
-                            await send_chunked_message(output, recipient, model_type)
-                        else:
-                            await send_imessage("⚠️ gemini 返回了空结果", recipient)
-                        return
-                except asyncio.TimeoutError:
-                    if app_state.current_process:
-                        app_state.current_process.kill()
-                    app_state.gemini_timeout_count += 1
-                    logger.warning(f"Gemini --resume 探测超时（第{app_state.gemini_timeout_count}次）")
-                    if app_state.gemini_timeout_count >= 2:
-                        memory.reset("gemini")
-                        app_state.gemini_timeout_count = 0
-                        logger.warning("Gemini 连续超时 2 次，已自动重置历史")
-                        await send_imessage("⚠️ Gemini 会话异常，已自动重置历史，重新开始", recipient)
-                    else:
-                        await send_imessage("⚠️ Gemini 会话恢复超时，降级为新会话重试", recipient)
-                    cmd = [path, "-y", "-p", full_content]
-                else:
-                    cmd = [path, "-y", "-p", full_content]
-            else:
-                cmd = [path, "-y", "-p", full_content]
+            # 用 ConversationMemory 文本注入替代不稳定的 --resume
+            ctx         = memory.get_context("gemini")
+            full_prompt = f"{ctx}{full_content}" if ctx else full_content
+            cmd = [path, "-y", "-p", full_prompt]
 
         elif model_type == "codex":
             ctx         = memory.get_context("codex")
