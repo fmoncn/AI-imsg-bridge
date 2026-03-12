@@ -48,13 +48,14 @@ You (iPhone) ──iMessage──▶ Mac ──▶ Claude / Gemini / Codex
 
 - **🤖 3 Models, 1 Interface** — Switch between Claude Code, Gemini CLI, and OpenAI Codex with a single command (`/c`, `/g`, `/x`)
 - **🧠 Persistent Memory** — Conversations carry over across sessions. Claude uses `--continue`, Gemini uses `--resume latest`, Codex gets injected history
-- **🔍 Real-Time Web Search** — Powered by Tavily. Mention "today", "latest", "price" and the bridge auto-searches before answering
+- **🔍 Real-Time Web Search** — Powered by Tavily. Only time-sensitive external questions auto-search; `/web ...` and `/local ...` override it explicitly
 - **🖼️ Image Understanding** — Send a screenshot or photo. HEIC auto-converts, Gemini analyzes it
-- **⏳ Progress Notifications** — Long tasks send a `⏳ thinking... (20s)` ping so you know it's working
+- **⏳ Progress Notifications** — Long tasks send staged progress updates every 40s instead of noisy 20s pings
 - **🛡️ Secret Key Auth** — Optional passphrase locks the bridge to only you
-- **📋 Task Queue** — Multiple messages queue up instead of being rejected
+- **📋 Task Queue** — Multiple unseen messages are fetched and queued in order, so bursts do not get dropped
 - **🔄 Always-On Service** — macOS `launchd` keeps it alive 24/7, auto-restarts on crash
 - **📝 Rotating Logs** — 5MB log files with 2 backups, never fills your disk
+- **🛑 Safer Task Control** — `/stop` kills the whole process group; dangerous tasks require `/confirm`
 
 ## 🚀 Quick Start
 
@@ -83,6 +84,15 @@ GEMINI_PATH=/path/to/gemini
 CODEX_PATH=/path/to/codex
 TAVILY_API_KEY=tvly-...                 # optional, for web search
 BRIDGE_SECRET=your_passphrase           # optional, recommended
+TIMEOUT_NORMAL=120
+TIMEOUT_SEARCH=160
+TIMEOUT_CODE=300
+TIMEOUT_IMAGE=240
+TAVILY_TIMEOUT=25
+PROGRESS_INTERVAL=40
+MAX_QUEUE_SIZE=20
+AUTO_ROUTE_IMAGES=1
+DANGEROUS_CONFIRMATION=1
 ```
 
 ### Run
@@ -102,11 +112,25 @@ Send yourself an iMessage: **`Hello!`** — you should get a reply within second
 | `/g` | Switch to Gemini CLI |
 | `/c` | Switch to Claude Code |
 | `/x` | Switch to OpenAI Codex |
+| `/web hello` | Force web search before answering |
+| `/local hello` | Answer locally without web search |
 | `/status` | Show current model, queue, memory |
+| `/service status` | Show launchd service status |
+| `/queue` | Show queued tasks |
+| `/tasks` | Show task dashboard |
+| `/task 123` | Show task detail |
+| `/task cancel 123` | Cancel a running or queued task |
+| `/task retry 123` | Requeue a finished/failed task |
+| `/review` | Review the latest completed task with two models |
+| `/review 123` | Review a specific completed task |
 | `/memory` | Show conversation history stats |
 | `/reset` | Clear current model's history |
 | `/reset all` | Clear all models' history |
 | `/stop` | Kill running task |
+| `/cancel all` | Stop running task and clear queued tasks |
+| `/clear queue` | Clear queued tasks |
+| `/restart` | Restart the bridge service |
+| `/confirm` | Confirm a dangerous queued task |
 | `/ping` | Health check → Pong! |
 | `/help` | Show all commands |
 
@@ -116,15 +140,18 @@ Send yourself an iMessage: **`Hello!`** — you should get a reply within second
 iMessage (iPhone/Mac)
     │
     ▼
-chat.db (SQLite, WAL mode)   ← bridge polls every 1s
+chat.db (SQLite, WAL mode)   ← bridge polls every 1s and fetches all unseen messages
     │
     ▼
 main.py (async Python)
     ├── verify_secret()          auth gate
-    ├── should_search()          keyword detection
+    ├── router.py                command normalization / directive parsing
+    ├── engine.py                routing / timeout / command building
     │   └── tavily_search()      real-time web context
     ├── prepare_image()          HEIC→JPEG via sips
     ├── ConversationMemory       per-model history (JSON)
+    ├── process registry         orphan-safe process cleanup
+    ├── store.py                 sqlite task / offset / review state
     └── run_ai_task()            subprocess → Claude/Gemini/Codex
             │
             ▼
@@ -135,12 +162,20 @@ main.py (async Python)
 
 ```
 AI-imsg-bridge/
-├── main.py                    # core bridge logic
+├── main.py                    # bridge entrypoint and orchestration
 ├── config.py                  # env-based configuration
+├── engine.py                  # model routing and execution policy
+├── router.py                  # command normalization and directive parsing
+├── state.py                   # app state, memory, health persistence
+├── store.py                   # sqlite-backed task and offset state
+├── message_store.py           # chat.db polling and attachment lookup
+├── process_utils.py           # process-group lifecycle and registry
+├── transport.py               # iMessage sending and chunking
 ├── manage.sh                  # service management CLI
 ├── com.fmon.claude_bridge.plist  # launchd service definition
 ├── .env.example               # configuration template
-└── requirements.txt
+├── requirements.txt
+└── requirements-dev.txt
 ```
 
 ---
@@ -168,13 +203,14 @@ AI-imsg-bridge/
 
 - **🤖 三模型一个入口** — `/c` `/g` `/x` 随时切换 Claude Code / Gemini / Codex
 - **🧠 对话记忆** — 跨会话保持上下文。Claude 用 `--continue`，Gemini 用 `--resume latest`，Codex 注入历史
-- **🔍 实时联网搜索** — Tavily 驱动。消息含"今天""最新""价格"等词自动搜索后再回答
+- **🔍 实时联网搜索** — Tavily 驱动。只对“时效性外部问题”自动搜索，也支持 `/web ...` 强制联网、`/local ...` 禁止联网
 - **🖼️ 图片理解** — 直接发截图或照片，HEIC 自动转换，Gemini 多模态分析
-- **⏳ 进度通知** — 长任务每 20s 推送一条 `⏳ 思考中...` 不再干等
+- **⏳ 进度通知** — 长任务每 40s 推送分阶段提示，减少弱网环境下的无效打扰
 - **🛡️ 口令认证** — 可选密语锁定，只有你能控制
 - **📋 任务队列** — 多条消息自动排队，不丢失
 - **🔄 永久后台** — launchd 守护进程，崩溃自动重启
 - **📝 滚动日志** — 5MB 轮转，永不撑满磁盘
+- **🛑 更安全的中断** — `/stop` 终止整个任务进程组，高风险请求需 `/confirm`
 
 ## 🚀 快速开始
 
@@ -203,6 +239,15 @@ GEMINI_PATH=/path/to/gemini
 CODEX_PATH=/path/to/codex
 TAVILY_API_KEY=tvly-...                   # 可选，开启联网搜索
 BRIDGE_SECRET=你的密语                    # 可选，强烈建议设置
+TIMEOUT_NORMAL=120
+TIMEOUT_SEARCH=160
+TIMEOUT_CODE=300
+TIMEOUT_IMAGE=240
+TAVILY_TIMEOUT=25
+PROGRESS_INTERVAL=40
+MAX_QUEUE_SIZE=20
+AUTO_ROUTE_IMAGES=1
+DANGEROUS_CONFIRMATION=1
 ```
 
 ### 启动
@@ -222,11 +267,25 @@ BRIDGE_SECRET=你的密语                    # 可选，强烈建议设置
 | `/g` | 切换至 Gemini CLI |
 | `/c` | 切换至 Claude Code |
 | `/x` | 切换至 OpenAI Codex |
+| `/web 内容` | 强制联网搜索后回答 |
+| `/local 内容` | 禁止联网搜索 |
 | `/status` | 查看当前模型、队列、记忆状态 |
+| `/service status` | 查看 launchd 服务状态 |
+| `/queue` | 查看排队任务 |
+| `/tasks` | 查看任务面板 |
+| `/task 123` | 查看任务详情 |
+| `/task cancel 123` | 取消运行中或排队中的任务 |
+| `/task retry 123` | 重新入队已结束任务 |
+| `/review` | 双模型复审最近完成任务 |
+| `/review 123` | 双模型复审指定任务 |
 | `/memory` | 查看各模型对话历史统计 |
 | `/reset` | 清空当前模型对话历史 |
 | `/reset all` | 清空所有模型历史 |
 | `/stop` | 中断当前任务 |
+| `/cancel all` | 清空排队任务并中断当前任务 |
+| `/clear queue` | 仅清空排队任务 |
+| `/restart` | 重启 Bridge 服务 |
+| `/confirm` | 确认执行高风险任务 |
 | `/ping` | 心跳检测 → Pong! |
 | `/help` | 查看所有指令 |
 
@@ -235,7 +294,16 @@ BRIDGE_SECRET=你的密语                    # 可选，强烈建议设置
 1. **设置 `BRIDGE_SECRET`**：每条消息需以密语开头，防止未授权访问
 2. **最小化 `SENDER_IDS`**：只填你自己的账号
 3. **`.env` 永不提交 git**：已在 `.gitignore` 中排除
-4. **定期查看日志**：`./manage.sh logs`
+4. **保留高风险确认**：默认启用 `DANGEROUS_CONFIRMATION=1`
+5. **定期查看日志**：`./manage.sh logs`
+
+## 🧪 Testing
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python3 -m pytest -q
+```
 
 ## 🛠️ 常用命令
 
