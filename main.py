@@ -1,6 +1,8 @@
 import asyncio
 import sqlite3
 import os
+import sys
+import random
 import signal
 import time
 import re
@@ -79,10 +81,12 @@ class ConversationMemory:
             self._has_session[model] = True
         self._save(model)
 
-    def get_context(self, model: str) -> str:
+    def get_context(self, model: str, max_turns: int | None = None) -> str:
         history = self._history.get(model, [])
         if not history:
             return ""
+        if max_turns:
+            history = history[-(max_turns * 2):]
         lines = ["[对话历史]"]
         for msg in history:
             prefix = "用户" if msg["role"] == "user" else "AI"
@@ -528,6 +532,7 @@ _BRIDGE_KEYWORDS = re.compile(
 )
 _BRIDGE_CONTEXT_PATH = os.path.expanduser("~/.claude_bridge/BRIDGE.md")
 _USER_CONTEXT_PATH   = os.path.expanduser("~/.claude_bridge/USER.md")
+_SOUL_CONTEXT_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SOUL.md")
 
 def get_task_timeout(content: str, has_search: bool) -> int:
     if _CODE_KEYWORDS.search(content):
@@ -537,30 +542,20 @@ def get_task_timeout(content: str, has_search: bool) -> int:
     return 60
 
 def load_bridge_context(content: str) -> str:
-    """始终注入用户上下文；bridge 相关任务额外注入项目文件"""
+    """仅 bridge 相关任务才注入 USER.md + BRIDGE.md，普通对话不注入避免 prompt 过长"""
+    if not _BRIDGE_KEYWORDS.search(content):
+        return ""
     parts = []
-    # 用户上下文：始终加载
-    try:
-        if os.path.exists(_USER_CONTEXT_PATH):
-            with open(_USER_CONTEXT_PATH) as f:
-                parts.append(f.read())
-    except Exception as e:
-        logger.warning(f"加载 USER.md 失败: {e}")
-
-    # 项目上下文：仅 bridge 相关任务加载
-    if _BRIDGE_KEYWORDS.search(content):
+    for path, label in [(_USER_CONTEXT_PATH, "USER.md"), (_BRIDGE_CONTEXT_PATH, "BRIDGE.md")]:
         try:
-            if os.path.exists(_BRIDGE_CONTEXT_PATH):
-                with open(_BRIDGE_CONTEXT_PATH) as f:
+            if os.path.exists(path):
+                with open(path) as f:
                     parts.append(f.read())
-                logger.info("📎 注入 BRIDGE.md 项目上下文")
         except Exception as e:
-            logger.warning(f"加载 BRIDGE.md 失败: {e}")
-
+            logger.warning(f"加载 {label} 失败: {e}")
     if parts:
-        logger.info("📎 注入用户上下文")
-        combined = "\n\n---\n\n".join(parts)
-        return f"[系统上下文]\n{combined}\n[以上为背景信息，请基于此作答]\n\n"
+        logger.info("📎 注入项目上下文（USER + BRIDGE）")
+        return f"[项目上下文]\n{'---'.join(parts)}\n[以上为背景，请基于此作答]\n\n"
     return ""
 
 # ── AI 任务执行 ───────────────────────────────────────────────────────────────
@@ -610,10 +605,10 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
         bridge_ctx   = load_bridge_context(content)
         full_content = f"{bridge_ctx}{search_prefix}{img_note}{content}"
 
-        env             = os.environ.copy()
-        env["NO_COLOR"] = "1"
-        env["TERM"]     = "dumb"
-        env["PATH"]     = f"{ROBUST_PATH}:{env.get('PATH', '')}"
+        cmd_env             = os.environ.copy()
+        cmd_env["NO_COLOR"] = "1"
+        cmd_env["TERM"]     = "dumb"
+        cmd_env["PATH"]     = f"{ROBUST_PATH}:{cmd_env.get('PATH', '')}"
 
         # ── 5. 构建命令（含记忆逻辑）─────────────────────────────────────────
         if model_type == "claude":
@@ -623,8 +618,8 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
                 cmd = [path, "-p", full_content]
 
         elif model_type == "gemini":
-            # 用 ConversationMemory 文本注入替代不稳定的 --resume
-            ctx         = memory.get_context("gemini")
+            # 文本注入最近 3 轮，避免 prompt 过长导致卡死
+            ctx         = memory.get_context("gemini", max_turns=3)
             full_prompt = f"{ctx}{full_content}" if ctx else full_content
             cmd = [path, "-y", "-p", full_prompt]
 
@@ -640,7 +635,7 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=cmd_env,
         )
 
         timeout = get_task_timeout(content, has_search)
@@ -687,7 +682,8 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
 
     except Exception as e:
         health.record_failure(model_type, str(e)[:40])
-        logger.error(f"执行异常: {e}")
+        import traceback
+        logger.error(f"执行异常: {e}\n{traceback.format_exc()}")
         await send_imessage(f"⚠️ 脚本异常: {e}", recipient)
     finally:
         stop_event.set()
@@ -903,7 +899,7 @@ async def main() -> None:
                 logger.error("连续 5 次异常，自愈重启进程...")
                 await send_imessage("⚠️ Bridge 检测到持续异常，正在自愈重启...", SENDER_ID)
                 await asyncio.sleep(2)
-                os.execv(__file__, [__file__])
+                os.execv(sys.executable, [sys.executable, __file__])
 
         await asyncio.sleep(1)
 
