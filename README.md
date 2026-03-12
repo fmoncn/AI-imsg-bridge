@@ -313,8 +313,24 @@ python3 -m venv .venv
 ./manage.sh restart   # 重启
 ./manage.sh status    # 状态
 ./manage.sh logs      # 实时日志
+./manage.sh inject "/ping"                      # 本地模拟一条入站消息
+./manage.sh inject "请描述这张图片" --attachment /tmp/demo.png
+./manage.sh inject "/status" --sender debug@local
 ./manage.sh uninstall # 卸载
 ```
+
+## 🧪 Local Debug Injection
+
+Use `inject` to simulate an inbound iMessage without relying on a real phone round-trip.
+
+```bash
+./manage.sh inject "/ping"
+./manage.sh inject "/tasks"
+./manage.sh inject "请描述这张图片" --attachment /path/to/file.png
+./manage.sh inject "/status" --sender debug@local
+```
+
+This runs the bridge logic locally, prints outgoing replies to stdout, and is useful for fast smoke tests.
 
 ## 🤝 Contributing
 

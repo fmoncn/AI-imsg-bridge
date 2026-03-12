@@ -64,13 +64,22 @@ case "$1" in
     logs)
         tail -f "$LOG_DIR/bridge.log"
         ;;
+    inject)
+        _check_env
+        shift
+        if [ -z "$1" ]; then
+            echo "用法: $0 inject \"消息内容\" [--sender debug@local] [--attachment /path/to/image]"
+            exit 1
+        fi
+        "$SCRIPT_DIR/.venv/bin/python3" "$SCRIPT_DIR/debug_inject.py" "$@"
+        ;;
     uninstall)
         "$0" stop 2>/dev/null || true
         rm -f "$PLIST_DST"
         echo "🗑️  服务已卸载"
         ;;
     *)
-        echo "用法: $0 {install|start|stop|restart|status|logs|uninstall}"
+        echo "用法: $0 {install|start|stop|restart|status|logs|inject|uninstall}"
         exit 1
         ;;
 esac
