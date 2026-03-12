@@ -25,9 +25,11 @@ CLI_PATHS = {
     "gemini": os.getenv("GEMINI_PATH", "/usr/local/bin/gemini"),
     "codex":  os.getenv("CODEX_PATH",  "/usr/local/bin/codex"),
 }
+CLAUDE_MODEL       = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CODEX_MODEL        = os.getenv("CODEX_MODEL", "gpt-5-codex")
 
 # ── 行为 ──────────────────────────────────────
-DEFAULT_MODEL       = os.getenv("DEFAULT_MODEL", "claude")
+DEFAULT_MODEL       = os.getenv("DEFAULT_MODEL", "gemini")
 CHUNK_SIZE          = int(os.getenv("CHUNK_SIZE", "2000"))
 MEMORY_TURNS        = int(os.getenv("MEMORY_TURNS", "10"))   # 每个模型保留最近 N 轮对话
 MEMORY_DIR          = os.path.expanduser("~/.claude_bridge/memory")
@@ -36,16 +38,21 @@ TIMEOUT_NORMAL      = int(os.getenv("TIMEOUT_NORMAL", "120"))
 TIMEOUT_SEARCH      = int(os.getenv("TIMEOUT_SEARCH", "160"))
 TIMEOUT_CODE        = int(os.getenv("TIMEOUT_CODE", "300"))
 TIMEOUT_IMAGE       = int(os.getenv("TIMEOUT_IMAGE", "240"))
+EARLY_NO_OUTPUT_TIMEOUT = int(os.getenv("EARLY_NO_OUTPUT_TIMEOUT", "20"))
 TASK_TIMEOUT        = TIMEOUT_CODE
 MAX_MSG_LEN         = int(os.getenv("MAX_MSG_LEN", "8000"))
 MAX_QUEUE_SIZE      = int(os.getenv("MAX_QUEUE_SIZE", "20"))
 AUTO_ROUTE_IMAGES   = os.getenv("AUTO_ROUTE_IMAGES", "1") == "1"
-HEARTBEAT_ENABLED   = os.getenv("HEARTBEAT_ENABLED", "1") == "1"
+HEARTBEAT_ENABLED   = os.getenv("HEARTBEAT_ENABLED", "0") == "1"
 QUIET_HOURS_START   = int(os.getenv("QUIET_HOURS_START", "0"))
 QUIET_HOURS_END     = int(os.getenv("QUIET_HOURS_END", "8"))
 DANGEROUS_CONFIRMATION = os.getenv("DANGEROUS_CONFIRMATION", "1") == "1"
 AUTO_FAST_ROUTING   = os.getenv("AUTO_FAST_ROUTING", "1") == "1"
 CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "low")
+GEMINI_MODEL        = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+IMESSAGE_BRIEF_MODE = os.getenv("IMESSAGE_BRIEF_MODE", "1") == "1"
+IMESSAGE_MAX_LINES  = int(os.getenv("IMESSAGE_MAX_LINES", "6"))
+IMESSAGE_MAX_CHARS  = int(os.getenv("IMESSAGE_MAX_CHARS", "220"))
 
 # ── 联网搜索 ───────────────────────────────────
 TAVILY_API_KEY    = os.getenv("TAVILY_API_KEY", "")

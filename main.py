@@ -14,13 +14,19 @@ from config import (
     AUTO_ROUTE_IMAGES,
     AUTO_FAST_ROUTING,
     BRIDGE_SECRET,
+    CLAUDE_MODEL,
     CHUNK_SIZE,
     CLI_PATHS,
+    CODEX_MODEL,
     DANGEROUS_CONFIRMATION,
     DB_PATH,
     DEFAULT_MODEL,
+    EARLY_NO_OUTPUT_TIMEOUT,
     HEALTH_STATE_PATH,
     HEARTBEAT_ENABLED,
+    IMESSAGE_BRIEF_MODE,
+    IMESSAGE_MAX_CHARS,
+    IMESSAGE_MAX_LINES,
     LOG_DIR,
     MAX_MSG_LEN,
     MAX_QUEUE_SIZE,
@@ -30,6 +36,7 @@ from config import (
     CODEX_REASONING_EFFORT,
     PROCESS_REGISTRY_PATH,
     PROGRESS_INTERVAL,
+    GEMINI_MODEL,
     QUIET_HOURS_END,
     QUIET_HOURS_START,
     ROBUST_PATH,
@@ -63,7 +70,13 @@ from process_utils import kill_registered_processes, register_process, terminate
 from router import command_arg, extract_search_directives, normalize_command
 from state import AppState, ConversationMemory, ModelHealth, TaskRequest
 from store import BridgeStore
-from transport import send_chunked_message, send_imessage, strip_ansi
+from transport import (
+    clear_undelivered_messages,
+    load_undelivered_messages,
+    send_chunked_message,
+    send_imessage,
+    strip_ansi,
+)
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -101,15 +114,18 @@ _DANGEROUS_KEYWORDS = re.compile(
     r"drop\s+table|truncate|shutdown|reboot",
     re.IGNORECASE,
 )
+_AUTH_REQUIRED_PATTERN = re.compile(
+    r"opening authentication page|how would you like to authenticate|authentication consent could not be obtained|"
+    r"do you want to continue\? \[y/n\]|not logged in|run /login",
+    re.IGNORECASE,
+)
 _FALLBACK_CHAIN = {
-    "gemini": ["claude", "codex"],
+    "gemini": ["codex"],
     "claude": ["gemini", "codex"],
-    "codex": ["claude", "gemini"],
+    "codex": ["gemini"],
 }
 _BRIDGE_CONTEXT_PATH = os.path.expanduser("~/.claude_bridge/BRIDGE.md")
 _USER_CONTEXT_PATH = os.path.expanduser("~/.claude_bridge/USER.md")
-
-
 def verify_secret(content: str) -> tuple[bool, str]:
     if not BRIDGE_SECRET:
         return True, content
@@ -166,7 +182,7 @@ def rotate_stderr_log() -> None:
         logger.warning(f"stderr 日志截断失败: {exc}")
 
 def load_bridge_context(content: str) -> str:
-    if not _BRIDGE_KEYWORDS.search(content):
+    if not BRIDGE_KEYWORDS.search(content):
         return ""
     parts = []
     for path, label in [(_USER_CONTEXT_PATH, "USER.md"), (_BRIDGE_CONTEXT_PATH, "BRIDGE.md")]:
@@ -180,6 +196,135 @@ def load_bridge_context(content: str) -> str:
         return ""
     logger.info("📎 注入项目上下文（USER + BRIDGE）")
     return f"[项目上下文]\n{'---'.join(parts)}\n[以上为背景，请基于此作答]\n\n"
+
+
+def cli_model_lines() -> list[str]:
+    selected_marks = {
+        "claude": "▶" if app_state.selected_model == "claude" else " ",
+        "gemini": "▶" if app_state.selected_model == "gemini" else " ",
+        "codex": "▶" if app_state.selected_model == "codex" else " ",
+    }
+    return [
+        "🧠 CLI 模型：",
+        f"{selected_marks['claude']} CLAUDE: {CLAUDE_MODEL}",
+        f"{selected_marks['gemini']} GEMINI: {GEMINI_MODEL}",
+        f"{selected_marks['codex']} CODEX: {CODEX_MODEL}",
+    ]
+
+
+def undelivered_snapshot_lines(limit: int = 5) -> list[str]:
+    rows = load_undelivered_messages(limit=limit)
+    if not rows:
+        return ["📭 无未送达消息"]
+    lines = ["📭 未送达消息："]
+    for index, row in enumerate(reversed(rows), 1):
+        snippet = row.get("message", "")[:40].replace("\n", " ")
+        reason = row.get("reason", "unknown")[:40]
+        lines.append(f"{index}. {row.get('recipient', '?')} | {reason} | {snippet}")
+    return lines
+
+
+def classify_cli_failure(output: str) -> tuple[str, str] | None:
+    text = strip_ansi(output or "")
+    if not text.strip():
+        return None
+    if _AUTH_REQUIRED_PATTERN.search(text):
+        return "auth required", "需要登录/认证"
+    if _QUOTA_PATTERN.search(text):
+        return "quota exhausted", "模型拥塞/配额受限"
+    return None
+
+
+async def collect_process_output(process, timeout: int, early_no_output_timeout: int) -> tuple[bytes, bytes, str | None]:
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    queue: asyncio.Queue[tuple[str, bytes] | tuple[str, None]] = asyncio.Queue()
+
+    async def pump(stream, name: str) -> None:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                await queue.put((name, None))
+                return
+            await queue.put((name, chunk))
+
+    pump_tasks = [
+        asyncio.create_task(pump(process.stdout, "stdout")),
+        asyncio.create_task(pump(process.stderr, "stderr")),
+    ]
+    closed = {"stdout": False, "stderr": False}
+    started_at = time.time()
+    last_output_at = started_at
+
+    try:
+        while True:
+            now = time.time()
+            if now - started_at >= timeout:
+                return b"".join(stdout_chunks), b"".join(stderr_chunks), "timeout"
+            if not stdout_chunks and not stderr_chunks and now - started_at >= early_no_output_timeout:
+                return b"".join(stdout_chunks), b"".join(stderr_chunks), "no output"
+            if closed["stdout"] and closed["stderr"] and queue.empty():
+                break
+            try:
+                source, chunk = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if chunk is None:
+                closed[source] = True
+                continue
+            last_output_at = time.time()
+            if source == "stdout":
+                stdout_chunks.append(chunk)
+            else:
+                stderr_chunks.append(chunk)
+            app_state.last_output_at = time.time()
+            combined = b"".join(stdout_chunks + stderr_chunks).decode("utf-8", errors="ignore")
+            classified = classify_cli_failure(combined)
+            if classified:
+                return b"".join(stdout_chunks), b"".join(stderr_chunks), classified[0]
+    finally:
+        for task in pump_tasks:
+            task.cancel()
+        await asyncio.gather(*pump_tasks, return_exceptions=True)
+
+    return b"".join(stdout_chunks), b"".join(stderr_chunks), None
+
+
+def build_fallback_task(task: TaskRequest, fallback: str) -> TaskRequest:
+    return TaskRequest(
+        model=fallback,
+        content=task.content,
+        recipient=task.recipient,
+        attachment=task.attachment,
+        force_search=task.force_search,
+        disable_search=task.disable_search,
+        rowid=task.rowid,
+        task_kind=task.task_kind,
+        review_group_id=task.review_group_id,
+        review_target_task_id=task.review_target_task_id,
+        review_role=task.review_role,
+    )
+
+
+def pick_available_model(preferred: str) -> str:
+    if health.is_available(preferred):
+        return preferred
+    for fallback in _FALLBACK_CHAIN.get(preferred, []):
+        if health.is_available(fallback):
+            return fallback
+    return preferred
+
+
+async def handle_fallback(task: TaskRequest, reason: str, notice: str) -> bool:
+    fallback = next((model for model in _FALLBACK_CHAIN.get(task.model, []) if health.is_available(model)), None)
+    if not fallback:
+        return False
+    store.update_task_status(task.task_id, "failed", error=f"{reason} -> fallback")
+    await send_imessage(f"⚠️ {task.model.upper()} {notice}\n🔄 自动切换 {fallback.upper()} 重试...", task.recipient, logger)
+    fallback_task = build_fallback_task(task, fallback)
+    fallback_task.task_id = store.create_task(fallback_task, status="queued")
+    await run_ai_task(fallback_task)
+    return True
 
 async def progress_notifier(task: TaskRequest, stop_event: asyncio.Event) -> None:
     if PROGRESS_INTERVAL <= 0:
@@ -255,7 +400,8 @@ def current_task_status() -> str:
     elapsed = int(time.time() - app_state.task_start_time)
     timeout = app_state.current_timeout or TASK_TIMEOUT
     task_id = f" #{app_state.current_task.task_id}" if app_state.current_task and app_state.current_task.task_id else ""
-    return f"⏳ 执行中{task_id} {elapsed}s / {timeout}s | {app_state.current_task.model.upper()}"
+    quiet_for = int(time.time() - app_state.last_output_at) if app_state.last_output_at else elapsed
+    return f"⏳ 执行中{task_id} {elapsed}s / {timeout}s | {app_state.current_task.model.upper()} | 最后输出 {quiet_for}s 前"
 
 
 def task_history_lines(limit: int = 3) -> list[str]:
@@ -469,8 +615,10 @@ async def handle_control_command(content: str, recipient: str) -> bool:
         search_status = "✅ 已启用" if TAVILY_API_KEY else "❌ 未配置"
         counts = store.task_counts()
         active_count = counts.get("running", 0) + counts.get("queued", 0) + counts.get("waiting_confirm", 0)
+        model_lines = cli_model_lines()
         msg = (
             f"🤖 当前模型: {app_state.selected_model.upper()}\n"
+            f"🧭 路由策略: 默认对话→GEMINI | 执行任务→CODEX | CLAUDE 仅 /c\n"
             f"{current_task_status()}\n"
             f"⏱️ 运行时长: {uptime}\n"
             f"📋 活动任务: {active_count} 条（运行 {counts.get('running', 0)} / 排队 {counts.get('queued', 0)} / 待确认 {counts.get('waiting_confirm', 0)}）\n"
@@ -479,6 +627,8 @@ async def handle_control_command(content: str, recipient: str) -> bool:
             f"🔒 口令: {'已启用' if BRIDGE_SECRET else '未启用'}\n"
             f"🧾 待确认: {app_state.pending_summary()}\n"
             + "\n".join(task_history_lines())
+            + "\n"
+            + "\n".join(model_lines)
             + "\n"
             f"📊 模型健康:\n"
             + "\n".join(
@@ -515,6 +665,23 @@ async def handle_control_command(content: str, recipient: str) -> bool:
 
     if cmd_lower == "/queue":
         await send_imessage("\n".join(queue_snapshot_lines()), recipient, logger)
+        return True
+
+    if cmd_lower == "/undelivered":
+        await send_imessage("\n".join(undelivered_snapshot_lines()), recipient, logger)
+        return True
+
+    if cmd_lower == "/resend":
+        rows = load_undelivered_messages(limit=10000)
+        if not rows:
+            await send_imessage("📭 当前没有未送达消息", recipient, logger)
+            return True
+        resent = 0
+        for row in rows:
+            await send_imessage(row.get("message", ""), row.get("recipient", recipient), logger)
+            resent += 1
+        cleared = clear_undelivered_messages()
+        await send_imessage(f"📨 已尝试重发 {resent} 条未送达消息，清理记录 {cleared} 条", recipient, logger)
         return True
 
     if cmd_lower == "/review":
@@ -635,6 +802,8 @@ async def handle_control_command(content: str, recipient: str) -> bool:
             "/health  → 健康详情 + 互救链\n"
             "/memory  → 记忆状态\n"
             "/queue   → 查看待处理队列\n"
+            "/undelivered → 查看未送达消息\n"
+            "/resend  → 重发未送达消息\n"
             "/tasks   → 查看任务面板\n"
             "/task 123 → 查看任务详情\n"
             "/task cancel 123 → 取消任务\n"
@@ -648,7 +817,7 @@ async def handle_control_command(content: str, recipient: str) -> bool:
             "/reset   → 清空当前模型历史\n"
             "/reset all → 清空所有历史\n"
             "/confirm → 确认高风险任务\n"
-            "/ping    → 心跳检测\n"
+            "/ping    → 连通性测试\n"
             "/help    → 本帮助",
             recipient,
             logger,
@@ -701,7 +870,18 @@ async def run_ai_task(task: TaskRequest) -> None:
         cmd_env["TERM"] = "dumb"
         cmd_env["PATH"] = f"{ROBUST_PATH}:{cmd_env.get('PATH', '')}"
 
-        cmd = build_command(task.model, full_content, CLI_PATHS, memory, CODEX_MEMORY_TURNS, CODEX_REASONING_EFFORT)
+        cmd = build_command(
+            task.model,
+            full_content,
+            CLI_PATHS,
+            memory,
+            CODEX_MEMORY_TURNS,
+            CODEX_REASONING_EFFORT,
+            GEMINI_MODEL,
+            IMESSAGE_BRIEF_MODE,
+            IMESSAGE_MAX_LINES,
+            IMESSAGE_MAX_CHARS,
+        )
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -715,12 +895,43 @@ async def run_ai_task(task: TaskRequest) -> None:
         progress_task = asyncio.create_task(progress_notifier(task, stop_event))
 
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout, stderr, failure_reason = await collect_process_output(process, timeout, EARLY_NO_OUTPUT_TIMEOUT)
         except asyncio.TimeoutError:
             terminate_process_tree(process, logger)
             health.record_failure(task.model, "timeout")
             store.update_task_status(task.task_id, "timeout", error=f">{timeout}s")
             await send_imessage(f"⚠️ {task.model} 任务超时（>{timeout}s）", task.recipient, logger)
+            return
+
+        if failure_reason == "timeout":
+            terminate_process_tree(process, logger)
+            health.record_failure(task.model, "timeout")
+            store.update_task_status(task.task_id, "timeout", error=f">{timeout}s")
+            await send_imessage(f"⚠️ {task.model} 任务超时（>{timeout}s）", task.recipient, logger)
+            return
+        if failure_reason == "no output":
+            terminate_process_tree(process, logger)
+            health.record_failure(task.model, "no output")
+            if await handle_fallback(task, "no output", f"{EARLY_NO_OUTPUT_TIMEOUT}s 内无有效输出"):
+                return
+            store.update_task_status(task.task_id, "failed", error="no output")
+            await send_imessage(f"⚠️ {task.model.upper()} {EARLY_NO_OUTPUT_TIMEOUT}s 内无有效输出", task.recipient, logger)
+            return
+        if failure_reason == "auth required":
+            terminate_process_tree(process, logger)
+            health.record_failure(task.model, "auth required")
+            if await handle_fallback(task, "auth required", "需要登录/认证"):
+                return
+            store.update_task_status(task.task_id, "failed", error="auth required")
+            await send_imessage(f"⚠️ {task.model.upper()} 需要登录/认证", task.recipient, logger)
+            return
+        if failure_reason == "quota exhausted":
+            terminate_process_tree(process, logger)
+            health.record_failure(task.model, "quota exhausted", quota=True)
+            if await handle_fallback(task, "quota exhausted", "模型拥塞/配额受限"):
+                return
+            store.update_task_status(task.task_id, "failed", error="all quota exhausted")
+            await send_imessage("⛔ 所有模型配额耗尽，请稍后重试", task.recipient, logger)
             return
 
         if process.returncode in (-15, -9):
@@ -738,26 +949,7 @@ async def run_ai_task(task: TaskRequest) -> None:
 
         if _QUOTA_PATTERN.search(output):
             health.record_failure(task.model, "quota exhausted", quota=True)
-            fallback = next((model for model in _FALLBACK_CHAIN.get(task.model, []) if health.is_available(model)), None)
-            if fallback:
-                store.update_task_status(task.task_id, "failed", error="quota exhausted -> fallback")
-                await send_imessage(
-                    f"⚠️ {task.model.upper()} 配额耗尽\n🔄 自动切换 {fallback.upper()} 重试...",
-                    task.recipient,
-                    logger,
-                )
-                await run_ai_task(
-                    TaskRequest(
-                        model=fallback,
-                        content=task.content,
-                        recipient=task.recipient,
-                        attachment=task.attachment,
-                        force_search=task.force_search,
-                        disable_search=task.disable_search,
-                        rowid=task.rowid,
-                    )
-                )
-            else:
+            if not await handle_fallback(task, "quota exhausted", "配额耗尽"):
                 store.update_task_status(task.task_id, "failed", error="all quota exhausted")
                 await send_imessage("⛔ 所有模型配额耗尽，请稍后重试", task.recipient, logger)
             return
@@ -858,6 +1050,8 @@ async def handle_incoming_message(message: IncomingMessage) -> None:
         disable_search,
         AUTO_FAST_ROUTING,
     )
+    preferred_model = target_model
+    target_model = pick_available_model(target_model)
     restore_model = None
     if message.attachment and AUTO_ROUTE_IMAGES and target_model != "gemini":
         restore_model = target_model
@@ -865,6 +1059,8 @@ async def handle_incoming_message(message: IncomingMessage) -> None:
         await send_imessage(f"🖼️ 图片已路由至 Gemini 处理，完成后恢复 {restore_model.upper()}", SENDER_ID, logger)
     elif target_model != app_state.selected_model:
         logger.info(f"⚡ 快速路由: {app_state.selected_model.upper()} -> {target_model.upper()} | {content[:40]!r}")
+    if target_model != preferred_model:
+        logger.info(f"🛡️ 模型避障: {preferred_model.upper()} 不可用 -> {target_model.upper()}")
 
     task = TaskRequest(
         model=target_model,
@@ -900,6 +1096,9 @@ async def main() -> None:
     killed = kill_registered_processes(PROCESS_REGISTRY_PATH, logger)
     if killed:
         logger.info(f"🧹 已清理 {len(killed)} 个遗留进程组")
+    recovered = store.cancel_active_tasks("bridge restarted")
+    if recovered:
+        logger.info(f"🧯 已回收 {recovered} 条遗留活动任务")
 
     if not SENDER_IDS:
         logger.error("❌ SENDER_IDS 未配置，请检查 .env 文件")

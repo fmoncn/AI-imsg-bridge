@@ -25,6 +25,19 @@ CODE_KEYWORDS = re.compile(
     r"代码|程序|函数|脚本|写|开发|实现|调试|debug|fix|bug|code|script|function|class|api",
     re.IGNORECASE,
 )
+SUMMARY_PATTERNS = re.compile(
+    r"总结|摘要|概况|进展|汇总|简报|总览|overview|summary|report|recap",
+    re.IGNORECASE,
+)
+EXPLANATION_PATTERNS = re.compile(
+    r"是什么|为什么|怎么|如何|介绍|说明|解释|分析|比较|建议|方案|思路|结论|原因|区别|recommend|explain|why|how|what is",
+    re.IGNORECASE,
+)
+EXECUTION_PATTERNS = re.compile(
+    r"修复|修改|改掉|重构|实现|编写|新增|删除|更新|运行|执行|测试|排查|检查|定位|提交|推送|部署|重启|查看日志|查日志|"
+    r"fix|implement|write|update|refactor|run|execute|test|debug|investigate|check|commit|push|deploy|restart",
+    re.IGNORECASE,
+)
 BRIDGE_KEYWORDS = re.compile(
     r"bridge|main\.py|config\.py|imessage|桥接|修复|升级|新功能|改一下|launchctl|功能|改进|优化",
     re.IGNORECASE,
@@ -37,6 +50,44 @@ SHORT_CHAT_PATTERNS = re.compile(
     r"^(你好|hi|hello|在吗|在不在|早上好|下午好|晚上好|你是谁|介绍一下自己)[!！。.\s]*$",
     re.IGNORECASE,
 )
+IDENTITY_PATTERNS = re.compile(
+    r"^(你是谁|你现在的模型是什么|当前模型是什么|自我介绍一下|介绍一下自己)[!！。.\s]*$",
+    re.IGNORECASE,
+)
+DETAIL_REQUEST_PATTERNS = re.compile(
+    r"详细|展开|具体说说|细讲|逐步|完整|完整版|详细说明|详细分析|深入|depth|detailed|step by step",
+    re.IGNORECASE,
+)
+
+
+def build_imessage_prompt(
+    content: str,
+    brief_mode: bool,
+    max_lines: int,
+    max_chars: int,
+) -> str:
+    if not brief_mode or DETAIL_REQUEST_PATTERNS.search(content):
+        return content
+    instruction = (
+        "[iMessage回复要求]\n"
+        "用简体中文，结果导向，先给结论再给必要信息。\n"
+        f"默认不超过{max_lines}行、约{max_chars}字。\n"
+        "非必要不要铺垫、客套、长解释；优先给结论、关键发现、下一步。\n\n"
+    )
+    return instruction + content
+
+
+def is_execution_task(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return False
+    if not (CODE_KEYWORDS.search(content) or EXECUTION_PATTERNS.search(content)):
+        return False
+    if SUMMARY_PATTERNS.search(content) or EXPLANATION_PATTERNS.search(content):
+        return False
+    if stripped.startswith("/"):
+        return False
+    return True
 
 
 def should_search(content: str, tavily_enabled: bool, force_search: bool = False, disable_search: bool = False) -> bool:
@@ -82,49 +133,79 @@ def prepare_image(raw_path: str, logger) -> str | None:
         return None
 
 
-def build_command(model: str, full_content: str, cli_paths: dict[str, str], memory, codex_memory_turns: int, codex_reasoning_effort: str) -> list[str]:
+def build_command(
+    model: str,
+    full_content: str,
+    cli_paths: dict[str, str],
+    memory,
+    codex_memory_turns: int,
+    codex_reasoning_effort: str,
+    gemini_model: str,
+    brief_mode: bool,
+    imessage_max_lines: int,
+    imessage_max_chars: int,
+) -> list[str]:
     path = cli_paths.get(model)
+    prompt_content = build_imessage_prompt(full_content, brief_mode, imessage_max_lines, imessage_max_chars)
     if model == "claude":
-        return [path, "-p", full_content, "--continue"] if memory.has_session("claude") else [path, "-p", full_content]
+        return [path, "-p", prompt_content, "--continue"] if memory.has_session("claude") else [path, "-p", prompt_content]
     if model == "gemini":
         ctx = memory.get_context("gemini", max_turns=3)
-        prompt = f"{ctx}{full_content}" if ctx else full_content
-        return [path, "-y", "-p", prompt]
+        prompt = f"{ctx}{prompt_content}" if ctx else prompt_content
+        cmd = [path, "-y"]
+        if gemini_model:
+            cmd.extend(["-m", gemini_model])
+        cmd.extend(["-p", prompt])
+        return cmd
     if model == "codex":
         ctx = memory.get_context("codex", max_turns=codex_memory_turns)
-        prompt = f"{ctx}{full_content}" if ctx else full_content
+        prompt = f"{ctx}{prompt_content}" if ctx else prompt_content
         return [path, "-c", f'model_reasoning_effort="{codex_reasoning_effort}"', "exec", prompt, "--skip-git-repo-check", "--full-auto"]
-    return [path, full_content]
+    return [path, prompt_content]
 
 
 def canned_reply(content: str) -> str | None:
     stripped = content.strip()
     if ACK_ONLY_PATTERNS.match(stripped):
         return "收到。"
+    if IDENTITY_PATTERNS.match(stripped):
+        return None
     if SHORT_CHAT_PATTERNS.match(stripped):
         return "我在。直接说任务。"
     return None
 
 
 def select_runtime_model(content: str, selected_model: str, has_attachment: bool, force_search: bool, disable_search: bool, auto_fast_routing: bool) -> str:
+    stripped = content.strip()
     if not auto_fast_routing:
         return selected_model
+    if selected_model == "claude":
+        return "claude"
     if has_attachment:
         return "gemini"
-    if selected_model != "codex":
-        return selected_model
+    is_execution = is_execution_task(content)
     if force_search:
-        return "claude"
+        return "gemini" if not is_execution else "codex"
     if disable_search:
-        return selected_model
-    if ACK_ONLY_PATTERNS.match(content.strip()) or SHORT_CHAT_PATTERNS.match(content.strip()):
-        return "claude"
+        return "codex" if is_execution else "gemini"
+    if IDENTITY_PATTERNS.match(stripped):
+        return "gemini" if selected_model != "claude" else "claude"
+    if SUMMARY_PATTERNS.search(content) and EXTERNAL_TOPIC_KEYWORDS.search(content):
+        return "gemini"
+    if SUMMARY_PATTERNS.search(content) and BRIDGE_KEYWORDS.search(content):
+        return "gemini"
+    if EXPLANATION_PATTERNS.search(content) and not is_execution:
+        return "gemini"
+    if not is_execution:
+        return "gemini"
+    if ACK_ONLY_PATTERNS.match(stripped) or SHORT_CHAT_PATTERNS.match(stripped):
+        return "gemini"
     if (
-        len(content.strip()) <= 16
+        len(stripped) <= 16
         and not CODE_KEYWORDS.search(content)
         and not BRIDGE_KEYWORDS.search(content)
         and not LOCAL_ONLY_PATTERNS.search(content)
         and not EXTERNAL_TOPIC_KEYWORDS.search(content)
     ):
-        return "claude"
-    return selected_model
+        return "gemini"
+    return "codex"

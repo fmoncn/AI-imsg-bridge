@@ -353,6 +353,26 @@ class BridgeStore:
         conn.close()
         return row
 
+    def cancel_active_tasks(self, reason: str = "bridge restarted") -> int:
+        now = time.time()
+        conn = self._connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET status = 'cancelled',
+                updated_at = ?,
+                finished_at = COALESCE(finished_at, ?),
+                error = COALESCE(error, ?)
+            WHERE status IN ('running', 'queued')
+            """,
+            (now, now, reason),
+        )
+        count = cur.rowcount
+        conn.commit()
+        conn.close()
+        return count
+
     def latest_completed_task(self, exclude_kinds: tuple[str, ...] = ("review",)) -> sqlite3.Row | None:
         conn = self._connect()
         cur = conn.cursor()

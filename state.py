@@ -172,6 +172,8 @@ class ModelHealth:
         self._last_error[model] = reason[:80]
         if quota:
             self._disabled_until[model] = time.time() + 3600
+        elif reason == "auth required":
+            self._disabled_until[model] = time.time() + 12 * 3600
         self._save()
 
     def success_rate(self, model: str) -> str:
@@ -185,6 +187,9 @@ class ModelHealth:
     def status_line(self, model: str) -> str:
         if not self.is_available(model):
             remain = int((self._disabled_until.get(model, 0) - time.time()) / 60)
+            last = self._last_error.get(model, "")
+            if last == "auth required":
+                return f"⛔ 需重新登录（{remain}分钟后重试）"
             return f"⛔ 配额耗尽（{remain}分钟后恢复）"
         failure = self._failure.get(model, 0)
         rate = self.success_rate(model)
@@ -200,6 +205,7 @@ class AppState:
         self.current_process = None
         self.current_task: TaskRequest | None = None
         self.current_timeout = 0
+        self.last_output_at = 0.0
         self.last_message_date = 0
         self.last_message_rowid = 0
         self.task_start_time = 0.0
@@ -218,12 +224,14 @@ class AppState:
         self.current_process = process
         self.current_timeout = timeout
         self.task_start_time = time.time()
+        self.last_output_at = self.task_start_time
 
     def clear_running(self) -> None:
         self.is_running = False
         self.current_task = None
         self.current_process = None
         self.current_timeout = 0
+        self.last_output_at = 0.0
 
     def pending_summary(self) -> str:
         if not self.pending_confirmation:

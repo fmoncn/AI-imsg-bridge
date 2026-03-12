@@ -1,4 +1,5 @@
 import main
+from state import ModelHealth
 
 
 def test_should_search_requires_external_topic():
@@ -18,3 +19,12 @@ def test_dangerous_request_detection():
     assert main.is_dangerous_request("rm -rf /tmp/demo")
     assert main.is_dangerous_request("请删除这个目录")
     assert not main.is_dangerous_request("帮我读取这个目录")
+
+
+def test_auth_required_disables_model_for_cooldown(tmp_path):
+    health = ModelHealth(str(tmp_path / "health.json"), main.logger)
+
+    health.record_failure("claude", "auth required")
+
+    assert health.is_available("claude") is False
+    assert "需重新登录" in health.status_line("claude")
