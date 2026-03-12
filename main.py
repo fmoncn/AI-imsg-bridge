@@ -636,6 +636,7 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=cmd_env,
+            start_new_session=True,  # 新进程组，killpg 可一次杀死所有子进程
         )
 
         timeout = get_task_timeout(content, has_search)
@@ -646,7 +647,10 @@ async def run_ai_task(model_type: str, content: str, recipient: str,
             )
         except asyncio.TimeoutError:
             if app_state.current_process:
-                app_state.current_process.kill()
+                try:
+                    os.killpg(os.getpgid(app_state.current_process.pid), signal.SIGTERM)
+                except Exception:
+                    app_state.current_process.kill()
             health.record_failure(model_type, "timeout")
             await send_imessage(f"⚠️ {model_type} 任务超时（>{timeout}s）", recipient)
             return
